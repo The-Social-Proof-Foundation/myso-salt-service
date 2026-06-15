@@ -39,9 +39,9 @@ USER appuser
 # Expose port
 EXPOSE 3000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
+# Health check (respects Railway PORT at runtime)
+HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --retries=5 \
+    CMD sh -c 'curl -f "http://127.0.0.1:${PORT:-3000}/health" || exit 1'
 
 # Run the binary
 CMD ["./myso-salt-service"] 

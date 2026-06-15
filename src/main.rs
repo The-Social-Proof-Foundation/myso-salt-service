@@ -53,15 +53,23 @@ async fn main() -> Result<()> {
         .is_some();
 
     if indexer_url_set {
-        let from_indexer =
-            indexer_platforms::fetch_allowed_clients_from_indexer(&http_for_indexer, &config)
-                .await?;
-        let env_clients = std::mem::take(&mut config.allowed_clients_env);
-        config.allowed_clients = merge_allowed_clients(from_indexer, env_clients);
-        info!(
-            count = config.allowed_clients.len(),
-            "Merged allowed clients from indexer and ALLOWED_CLIENTS"
-        );
+        match indexer_platforms::fetch_allowed_clients_from_indexer(&http_for_indexer, &config).await {
+            Ok(from_indexer) => {
+                let env_clients = std::mem::take(&mut config.allowed_clients_env);
+                config.allowed_clients = merge_allowed_clients(from_indexer, env_clients);
+                info!(
+                    count = config.allowed_clients.len(),
+                    "Merged allowed clients from indexer and ALLOWED_CLIENTS"
+                );
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Indexer platform fetch failed; continuing with ALLOWED_CLIENTS env only"
+                );
+                config.allowed_clients = std::mem::take(&mut config.allowed_clients_env);
+            }
+        }
     } else {
         config.allowed_clients = std::mem::take(&mut config.allowed_clients_env);
     }
@@ -135,16 +143,28 @@ async fn main() -> Result<()> {
 }
 
 fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
-    // CORS configuration
-    let cors = CorsLayer::new()
-        .allow_origin(
-            allowed_origins
-                .iter()
-                .map(|o| o.parse().unwrap())
-                .collect::<Vec<_>>(),
-        )
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+    let origins: Vec<_> = allowed_origins
+        .iter()
+        .filter_map(|o| {
+            o.trim()
+                .parse()
+                .map_err(|e| {
+                    error!("Invalid ALLOWED_ORIGINS entry {:?}: {}", o, e);
+                })
+                .ok()
+        })
+        .collect();
+
+    let cors = if origins.is_empty() {
+        CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+    } else {
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+    };
 
     let mut router = Router::new()
         .route("/health", get(myso_salt_service::handlers::health_check))

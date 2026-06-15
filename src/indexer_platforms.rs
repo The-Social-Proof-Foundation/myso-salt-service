@@ -188,6 +188,19 @@ pub async fn fetch_allowed_clients_from_indexer(
                 continue;
             }
 
+            let has_global_callback = cfg
+                .auth_callback_url
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if redirect.is_none() && !has_global_callback {
+                tracing::debug!(
+                    platform_id = ?row.platform_id,
+                    "skipping platform (no redirect URI and AUTH_CALLBACK_URL not configured)"
+                );
+                continue;
+            }
+
             let redirect_uri = redirect.unwrap_or_default();
             let Some(pid) = row.platform_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
                 continue;
@@ -269,5 +282,63 @@ mod tests {
             redirect_uri_from_links(Some(&links), &keys).as_deref(),
             Some("https://two.test/cb")
         );
+    }
+
+    fn test_config(auth_callback_url: Option<&str>) -> Config {
+        Config {
+            database_url: "postgresql://localhost/db".into(),
+            master_seed_base64: String::new(),
+            port: 3000,
+            allowed_origins: vec![],
+            rate_limit_per_minute: 60,
+            log_level: "info".into(),
+            twitch_client_id: None,
+            twitch_client_secret: None,
+            facebook_app_secret: None,
+            facebook_app_id: None,
+            allowed_audience_google: None,
+            google_client_secret: None,
+            allowed_audience_apple: None,
+            apple_team_id: None,
+            apple_key_identifier: None,
+            apple_private_key: None,
+            allowed_audience_facebook: None,
+            allowed_audience_twitch: None,
+            auth_callback_url: auth_callback_url.map(str::to_string),
+            allowed_clients_env: vec![],
+            allowed_clients: vec![],
+            myso_indexer_graphql_url: Some("http://indexer.test/graphql".into()),
+            indexer_platforms_page_limit: 200,
+            require_redirect_uri_from_links: false,
+            platform_status_allowlist: None,
+            platform_status_denylist: vec!["Shutdown".into(), "Sunset".into()],
+            platform_links_redirect_keys: vec!["website".into(), "url".into()],
+            mysocial_auth_issuer: None,
+            mysocial_auth_jwks_uri: None,
+            allowed_audience_mysocial: None,
+            jwt_signing_key: None,
+            jwt_issuer: None,
+        }
+    }
+
+    #[test]
+    fn skips_platform_without_redirect_when_no_global_callback() {
+        let row = PlatformRow {
+            platform_id: Some("platform-1".into()),
+            name: None,
+            developer_address: None,
+            status_text: Some("Live".into()),
+            shutdown_date: None,
+            links: None,
+        };
+        let cfg = test_config(None);
+        let redirect = redirect_uri_from_links(row.links.as_ref(), &cfg.platform_links_redirect_keys);
+        let has_global_callback = cfg
+            .auth_callback_url
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        assert!(redirect.is_none());
+        assert!(!has_global_callback);
     }
 }
