@@ -633,6 +633,7 @@ pub async fn auth_provider_callback(
         Ok(address) => {
             let mut user_obj = serde_json::Map::new();
             user_obj.insert("address".to_string(), serde_json::Value::String(address));
+            user_obj.insert("sub".to_string(), serde_json::Value::String(claims.sub.clone()));
             if let Some(ref email) = claims.email {
                 user_obj.insert("email".to_string(), serde_json::Value::String(email.clone()));
             }
@@ -644,15 +645,66 @@ pub async fn auth_provider_callback(
         }
     };
 
+    let (session_access_token, refresh_token, expires_in) =
+        if let (Some(ref key_b64), Some(ref issuer)) =
+            (&state.config.jwt_signing_key, &state.config.jwt_issuer)
+        {
+            let key_bytes = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                key_b64,
+            )
+            .map_err(|e| {
+                error!("Invalid JWT_SIGNING_KEY base64: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Invalid server configuration".to_string())
+            })?;
+
+            if key_bytes.len() < 32 {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "JWT_SIGNING_KEY must be at least 32 bytes".to_string(),
+                ));
+            }
+
+            let access_token = session_token::issue_access_token(&user_identifier, issuer, &key_bytes)
+                .map_err(|e| {
+                    error!("Failed to issue access token: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Token issuance failed".to_string())
+                })?;
+
+            let (refresh_opaque, refresh_hash) = session_token::generate_refresh_token()
+                .map_err(|e| {
+                    error!("Failed to generate refresh token: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Token generation failed".to_string())
+                })?;
+
+            let expires_at = chrono::Utc::now() + chrono::Duration::days(30);
+            state
+                .store
+                .store_refresh_session(&user_identifier, &refresh_hash, expires_at)
+                .await
+                .map_err(|e| {
+                    error!("Failed to store refresh session: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Session storage failed".to_string())
+                })?;
+
+            (
+                Some(access_token),
+                Some(refresh_opaque),
+                Some(1800u64),
+            )
+        } else {
+            (None, None, None)
+        };
+
     Ok(Json(AuthCallbackResponse {
         code,
         salt: salt_str,
         id_token: tokens.id_token.clone(),
         user,
         access_token: tokens.access_token,
-        session_access_token: None,
-        refresh_token: None,
-        expires_in: None,
+        session_access_token,
+        refresh_token,
+        expires_in,
     }))
 }
 
