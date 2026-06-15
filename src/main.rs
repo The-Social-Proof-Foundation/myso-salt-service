@@ -12,7 +12,7 @@ use tower_http::{
     limit::RequestBodyLimitLayer,
     trace::TraceLayer,
 };
-use tracing::{info, error};
+use tracing::{info, error, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use myso_salt_service::{
@@ -63,9 +63,9 @@ async fn main() -> Result<()> {
                 );
             }
             Err(e) => {
-                error!(
+                warn!(
                     error = %e,
-                    "Indexer platform fetch failed; continuing with ALLOWED_CLIENTS env only"
+                    "Indexer platform fetch failed; continuing with ALLOWED_CLIENTS env only (indexer DB may be behind — e.g. missing cover_photo column)"
                 );
                 config.allowed_clients = std::mem::take(&mut config.allowed_clients_env);
             }

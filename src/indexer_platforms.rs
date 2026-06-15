@@ -8,10 +8,7 @@ use crate::config::{AllowedClient, Config};
 const ACTIVE_PLATFORMS_QUERY: &str = r#"query ActivePlatforms($limit: Int, $offset: Int) {
   platforms(approvedOnly: true, limit: $limit, offset: $offset) {
     platformId
-    name
-    developerAddress
     statusText
-    shutdownDate
     links
   }
 }"#;
