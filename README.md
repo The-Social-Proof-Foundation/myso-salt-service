@@ -21,6 +21,10 @@ This service provides secure salt generation and storage for zkLogin authenticat
 - **Health Monitoring**: Built-in health checks and metrics endpoints
 - **Production Ready**: Graceful shutdown, structured logging, and error handling
 
+## Related services
+
+**Identity verification is intentionally not part of this service.** X/Twitter verification, ecosystem badges, share campaigns, and social graph import live in [`myso-identity-verification`](https://github.com/the-social-proof-foundation/myso-identity-verification) (`identity-verification.mysocial.network`). This salt service handles authentication only: OAuth salt backup, session tokens, and wallet address derivation.
+
 ## Architecture
 
 ```
@@ -142,6 +146,11 @@ GOOGLE_CLIENT_SECRET=<your-google-client-secret>
 APPLE_TEAM_ID=<your-apple-team-id>
 APPLE_KEY_IDENTIFIER=<your-apple-key-id>
 APPLE_PRIVATE_KEY=<your-apple-private-key-pem>
+
+# MySocial platform sessions. JWT_SIGNING_KEY is a base64 Ed25519 seed (32 bytes minimum).
+JWT_SIGNING_KEY=<base64-ed25519-private-seed>
+JWT_ISSUER=https://salt.testnet.mysocial.network
+JWT_KEY_ID=mysocial-salt
 ```
 
 ### 4. Deploy
@@ -159,6 +168,22 @@ Validates the salt service is ready (DB connectivity, salt derivation). Returns 
 OAuth callback endpoint. Receives `{ client_id, code, provider?, state?, nonce?, code_verifier?, redirect_uri? }`. Looks up `client_id` in the merged list: indexer platforms (`platformId`) plus `ALLOWED_CLIENTS`, with env overriding duplicates. Token exchange uses `redirect_uri` from the request when valid, else each client’s stored `redirect_uri`, else `AUTH_CALLBACK_URL`. Exchanges code for tokens in-band (Google, Apple, Facebook, Twitch), fetches salt, returns `{ code, user?, salt, access_token? }`. Routes register when the merged allowlist is non-empty.
 
 Register OAuth redirect URIs in Google (etc.) to match the exact `redirect_uri` used for that client — often from indexer `links` JSON keys configured via `PLATFORM_LINKS_REDIRECT_KEYS`.
+
+### GET /.well-known/jwks.json
+
+Publishes the Ed25519 public key used to verify MySocial session JWTs. Platform backends cache this
+JWKS and validate issuer, audience, expiry, and `wallet_address` without receiving private signing
+material.
+
+### POST /auth/refresh
+
+Rotates a MySocial refresh token and returns `{ session_access_token, refresh_token, expires_in,
+user }`. Reuse of a revoked refresh token revokes the remaining session family.
+
+### POST /auth/logout
+
+Revokes the supplied `{ refresh_token }`. The endpoint is idempotent so clients can always clear
+local credentials after the request.
 
 ### POST /salt
 Get or create salt for a user.

@@ -314,6 +314,7 @@ mod tests {
             mysocial_auth_jwks_uri: None,
             allowed_audience_mysocial: None,
             jwt_signing_key: None,
+            jwt_key_id: "mysocial-salt".into(),
             jwt_issuer: None,
         }
     }

@@ -249,17 +249,24 @@ impl SaltStore {
     pub async fn store_refresh_session(
         &self,
         user_identifier: &str,
+        wallet_address: &str,
+        provider: &str,
+        client_id: &str,
         refresh_token_hash: &str,
         expires_at: chrono::DateTime<Utc>,
     ) -> Result<Uuid> {
         let row: (Uuid,) = sqlx::query_as(
             r#"
-            INSERT INTO refresh_sessions (user_identifier, refresh_token_hash, expires_at)
-            VALUES ($1, $2, $3)
+            INSERT INTO refresh_sessions
+                (user_identifier, wallet_address, provider, client_id, refresh_token_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id
             "#,
         )
         .bind(user_identifier)
+        .bind(wallet_address)
+        .bind(provider)
+        .bind(client_id)
         .bind(refresh_token_hash)
         .bind(expires_at)
         .fetch_one(&self.pool)
@@ -273,7 +280,8 @@ impl SaltStore {
     pub async fn get_refresh_session(&self, refresh_token_hash: &str) -> Result<Option<RefreshSession>> {
         let session = sqlx::query_as::<_, RefreshSession>(
             r#"
-            SELECT id, user_identifier, refresh_token_hash, expires_at, created_at
+            SELECT id, user_identifier, wallet_address, provider, client_id,
+                   refresh_token_hash, expires_at, created_at
             FROM refresh_sessions
             WHERE refresh_token_hash = $1 AND expires_at > NOW()
             "#,
@@ -299,6 +307,125 @@ impl SaltStore {
         .context("Failed to delete refresh session")?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Atomically consume an active refresh token, record it as revoked, and
+    /// replace it with a rotated token that keeps the original absolute expiry.
+    pub async fn rotate_refresh_session(
+        &self,
+        old_refresh_token_hash: &str,
+        new_refresh_token_hash: &str,
+    ) -> Result<Option<RefreshSession>> {
+        let mut tx = self.pool.begin().await.context("Failed to begin refresh rotation")?;
+        let session = sqlx::query_as::<_, RefreshSession>(
+            r#"
+            SELECT id, user_identifier, wallet_address, provider, client_id,
+                   refresh_token_hash, expires_at, created_at
+            FROM refresh_sessions
+            WHERE refresh_token_hash = $1 AND expires_at > NOW()
+            FOR UPDATE
+            "#,
+        )
+        .bind(old_refresh_token_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("Failed to lock refresh session")?;
+
+        let Some(session) = session else {
+            tx.rollback().await.ok();
+            return Ok(None);
+        };
+
+        sqlx::query("DELETE FROM refresh_sessions WHERE id = $1")
+            .bind(session.id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to consume refresh session")?;
+        sqlx::query(
+            r#"
+            INSERT INTO revoked_refresh_tokens (refresh_token_hash, user_identifier)
+            VALUES ($1, $2)
+            ON CONFLICT (refresh_token_hash) DO NOTHING
+            "#,
+        )
+        .bind(old_refresh_token_hash)
+        .bind(&session.user_identifier)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to record rotated refresh token")?;
+        sqlx::query(
+            r#"
+            INSERT INTO refresh_sessions
+                (user_identifier, wallet_address, provider, client_id, refresh_token_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(&session.user_identifier)
+        .bind(&session.wallet_address)
+        .bind(&session.provider)
+        .bind(&session.client_id)
+        .bind(new_refresh_token_hash)
+        .bind(session.expires_at)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to store rotated refresh session")?;
+        tx.commit().await.context("Failed to commit refresh rotation")?;
+        Ok(Some(session))
+    }
+
+    /// Revoke an active refresh token. Logout is idempotent when the token is
+    /// already missing or revoked.
+    pub async fn revoke_refresh_session(&self, refresh_token_hash: &str) -> Result<Option<String>> {
+        let mut tx = self.pool.begin().await.context("Failed to begin refresh revocation")?;
+        let user_identifier: Option<String> = sqlx::query_scalar(
+            "SELECT user_identifier FROM refresh_sessions WHERE refresh_token_hash = $1 FOR UPDATE",
+        )
+        .bind(refresh_token_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("Failed to lock refresh session for revocation")?;
+        let Some(user_identifier) = user_identifier else {
+            tx.rollback().await.ok();
+            return Ok(None);
+        };
+        sqlx::query("DELETE FROM refresh_sessions WHERE refresh_token_hash = $1")
+            .bind(refresh_token_hash)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to delete refresh session")?;
+        sqlx::query(
+            r#"
+            INSERT INTO revoked_refresh_tokens (refresh_token_hash, user_identifier)
+            VALUES ($1, $2)
+            ON CONFLICT (refresh_token_hash) DO NOTHING
+            "#,
+        )
+        .bind(refresh_token_hash)
+        .bind(&user_identifier)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to persist refresh revocation")?;
+        tx.commit().await.context("Failed to commit refresh revocation")?;
+        Ok(Some(user_identifier))
+    }
+
+    pub async fn revoked_refresh_owner(&self, refresh_token_hash: &str) -> Result<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT user_identifier FROM revoked_refresh_tokens WHERE refresh_token_hash = $1",
+        )
+        .bind(refresh_token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to check revoked refresh token")
+    }
+
+    pub async fn delete_refresh_sessions_for_user(&self, user_identifier: &str) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM refresh_sessions WHERE user_identifier = $1")
+            .bind(user_identifier)
+            .execute(&self.pool)
+            .await
+            .context("Failed to revoke refresh token family")?;
+        Ok(result.rows_affected())
     }
 
     /// Clean up expired refresh sessions.

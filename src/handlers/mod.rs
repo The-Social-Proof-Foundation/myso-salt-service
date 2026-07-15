@@ -14,7 +14,8 @@ use crate::{
     auth::exchange,
     models::{
         GetSaltRequest, GetSaltResponse, HealthCheckResponse, ActionType,
-        AuthCallbackRequest, AuthCallbackResponse, WalletAuthRequest,
+        AuthCallbackRequest, AuthCallbackResponse, LogoutRequest, RefreshRequest,
+        RefreshResponse, WalletAuthRequest,
     },
     security::{
         address_derivation,
@@ -566,6 +567,17 @@ pub async fn auth_provider_callback(
         ));
     };
 
+    if provider == "google" || provider == "apple" {
+        let expected_nonce = request
+            .nonce
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or((StatusCode::BAD_REQUEST, "nonce is required".to_string()))?;
+        if claims.nonce.as_deref() != Some(expected_nonce) {
+            return Err((StatusCode::UNAUTHORIZED, "Invalid nonce".to_string()));
+        }
+    }
+
     let user_identifier = JwtValidator::generate_user_identifier(&claims);
     tracing::debug!(
         "Auth callback: salt lookup for user {} (iss: {}, sub: {})",
@@ -629,43 +641,35 @@ pub async fn auth_provider_callback(
         .unwrap_or_default();
 
     let salt_str = salt_to_bigint_string(&salt);
-    let user = match address_derivation::derive_ed25519_address(&claims.sub, &salt_str) {
-        Ok(address) => {
-            let mut user_obj = serde_json::Map::new();
-            user_obj.insert("address".to_string(), serde_json::Value::String(address));
-            user_obj.insert("sub".to_string(), serde_json::Value::String(claims.sub.clone()));
-            if let Some(ref email) = claims.email {
-                user_obj.insert("email".to_string(), serde_json::Value::String(email.clone()));
-            }
-            Some(serde_json::Value::Object(user_obj))
-        }
-        Err(e) => {
+    let wallet_address = address_derivation::derive_ed25519_address(&claims.sub, &salt_str)
+        .map_err(|e| {
             error!("Failed to derive Ed25519 address: {}", e);
-            None
-        }
-    };
+            (StatusCode::INTERNAL_SERVER_ERROR, "Wallet derivation failed".to_string())
+        })?;
+    let mut user_obj = serde_json::Map::new();
+    user_obj.insert(
+        "address".to_string(),
+        serde_json::Value::String(wallet_address.clone()),
+    );
+    user_obj.insert("sub".to_string(), serde_json::Value::String(claims.sub.clone()));
+    if let Some(ref email) = claims.email {
+        user_obj.insert("email".to_string(), serde_json::Value::String(email.clone()));
+    }
+    let user = Some(serde_json::Value::Object(user_obj));
 
     let (session_access_token, refresh_token, expires_in) =
         if let (Some(ref key_b64), Some(ref issuer)) =
             (&state.config.jwt_signing_key, &state.config.jwt_issuer)
         {
-            let key_bytes = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
+            let access_token = session_token::issue_access_token(
+                &user_identifier,
+                &wallet_address,
+                &provider,
+                &request.client_id,
+                issuer,
                 key_b64,
+                &state.config.jwt_key_id,
             )
-            .map_err(|e| {
-                error!("Invalid JWT_SIGNING_KEY base64: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Invalid server configuration".to_string())
-            })?;
-
-            if key_bytes.len() < 32 {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "JWT_SIGNING_KEY must be at least 32 bytes".to_string(),
-                ));
-            }
-
-            let access_token = session_token::issue_access_token(&user_identifier, issuer, &key_bytes)
                 .map_err(|e| {
                     error!("Failed to issue access token: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, "Token issuance failed".to_string())
@@ -680,7 +684,14 @@ pub async fn auth_provider_callback(
             let expires_at = chrono::Utc::now() + chrono::Duration::days(30);
             state
                 .store
-                .store_refresh_session(&user_identifier, &refresh_hash, expires_at)
+                .store_refresh_session(
+                    &user_identifier,
+                    &wallet_address,
+                    &provider,
+                    &request.client_id,
+                    &refresh_hash,
+                    expires_at,
+                )
                 .await
                 .map_err(|e| {
                     error!("Failed to store refresh session: {}", e);
@@ -766,23 +777,15 @@ pub async fn auth_wallet_callback(
         if let (Some(ref key_b64), Some(ref issuer)) =
             (&state.config.jwt_signing_key, &state.config.jwt_issuer)
         {
-            let key_bytes = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
+            let access_token = session_token::issue_access_token(
+                &user_identifier,
+                &request.address,
+                "wallet",
+                &request.client_id,
+                issuer,
                 key_b64,
+                &state.config.jwt_key_id,
             )
-            .map_err(|e| {
-                error!("Invalid JWT_SIGNING_KEY base64: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Invalid server configuration".to_string())
-            })?;
-
-            if key_bytes.len() < 32 {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "JWT_SIGNING_KEY must be at least 32 bytes".to_string(),
-                ));
-            }
-
-            let access_token = session_token::issue_access_token(&user_identifier, issuer, &key_bytes)
                 .map_err(|e| {
                     error!("Failed to issue access token: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, "Token issuance failed".to_string())
@@ -797,7 +800,14 @@ pub async fn auth_wallet_callback(
             let expires_at = Utc::now() + chrono::Duration::days(30);
             state
                 .store
-                .store_refresh_session(&user_identifier, &refresh_hash, expires_at)
+                .store_refresh_session(
+                    &user_identifier,
+                    &request.address,
+                    "wallet",
+                    &request.client_id,
+                    &refresh_hash,
+                    expires_at,
+                )
                 .await
                 .map_err(|e| {
                     error!("Failed to store refresh session: {}", e);
@@ -823,6 +833,133 @@ pub async fn auth_wallet_callback(
         refresh_token,
         expires_in,
     }))
+}
+
+pub async fn auth_refresh(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(request): Json<RefreshRequest>,
+) -> Result<Json<RefreshResponse>, (StatusCode, String)> {
+    if request.refresh_token.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "refresh_token is required".to_string()));
+    }
+    let ip_address = addr.ip().to_string();
+    let allowed = state
+        .store
+        .check_rate_limit(&format!("refresh:{ip_address}"), 1, 10)
+        .await
+        .map_err(|e| {
+            error!("Refresh rate limit check failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string())
+        })?;
+    if !allowed {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string()));
+    }
+
+    let old_hash = session_token::hash_refresh_token(&request.refresh_token);
+    if let Some(user_identifier) = state
+        .store
+        .revoked_refresh_owner(&old_hash)
+        .await
+        .map_err(|e| {
+            error!("Failed to check refresh reuse: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string())
+        })?
+    {
+        state
+            .store
+            .delete_refresh_sessions_for_user(&user_identifier)
+            .await
+            .map_err(|e| {
+                error!("Failed to revoke replayed refresh family: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string())
+            })?;
+        return Err((StatusCode::UNAUTHORIZED, "Refresh token revoked".to_string()));
+    }
+
+    let (new_refresh_token, new_refresh_hash) = session_token::generate_refresh_token()
+        .map_err(|e| {
+            error!("Failed to generate refresh token: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Token generation failed".to_string())
+        })?;
+    let session = state
+        .store
+        .rotate_refresh_session(&old_hash, &new_refresh_hash)
+        .await
+        .map_err(|e| {
+            error!("Refresh rotation failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Session rotation failed".to_string())
+        })?
+        .ok_or((StatusCode::UNAUTHORIZED, "Invalid refresh token".to_string()))?;
+
+    let key = state
+        .config
+        .jwt_signing_key
+        .as_deref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Session signing unavailable".to_string()))?;
+    let issuer = state
+        .config
+        .jwt_issuer
+        .as_deref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Session issuer unavailable".to_string()))?;
+    let access_token = session_token::issue_access_token(
+        &session.user_identifier,
+        &session.wallet_address,
+        &session.provider,
+        &session.client_id,
+        issuer,
+        key,
+        &state.config.jwt_key_id,
+    )
+    .map_err(|e| {
+        error!("Failed to issue refreshed access token: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Token issuance failed".to_string())
+    })?;
+
+    Ok(Json(RefreshResponse {
+        access_token: access_token.clone(),
+        session_access_token: access_token,
+        refresh_token: new_refresh_token,
+        expires_in: session_token::ACCESS_TOKEN_EXPIRY_SECS as u64,
+        user: serde_json::json!({
+            "address": session.wallet_address,
+        }),
+    }))
+}
+
+pub async fn auth_logout(
+    State(state): State<AppState>,
+    Json(request): Json<LogoutRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if request.refresh_token.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "refresh_token is required".to_string()));
+    }
+    let refresh_hash = session_token::hash_refresh_token(&request.refresh_token);
+    state
+        .store
+        .revoke_refresh_session(&refresh_hash)
+        .await
+        .map_err(|e| {
+            error!("Refresh revocation failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Session revocation failed".to_string())
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn session_jwks(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let key = state
+        .config
+        .jwt_signing_key
+        .as_deref()
+        .ok_or((StatusCode::NOT_FOUND, "JWKS unavailable".to_string()))?;
+    session_token::jwks(key, &state.config.jwt_key_id)
+        .map(Json)
+        .map_err(|e| {
+            error!("Failed to build JWKS: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "JWKS unavailable".to_string())
+        })
 }
 
 /// Get service metrics

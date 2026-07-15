@@ -174,9 +174,31 @@ pub struct AuthCallbackResponse {
 pub struct RefreshSession {
     pub id: Uuid,
     pub user_identifier: String,
+    pub wallet_address: String,
+    pub provider: String,
+    pub client_id: String,
     pub refresh_token_hash: String,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshResponse {
+    pub access_token: String,
+    pub session_access_token: String,
+    pub refresh_token: String,
+    pub expires_in: u64,
+    pub user: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogoutRequest {
+    pub refresh_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,4 +297,4 @@ impl OAuthProviderConfig {
             userinfo_endpoint: None,
         }
     }
-} 
+}

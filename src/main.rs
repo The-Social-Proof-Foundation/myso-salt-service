@@ -171,7 +171,19 @@ fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/salt", post(myso_salt_service::handlers::get_salt))
         .route("/salt/check", get(myso_salt_service::handlers::salt_check))
         .route("/salt/test", post(myso_salt_service::handlers::get_salt_test))
-        .route("/metrics", get(myso_salt_service::handlers::get_metrics));
+        .route("/metrics", get(myso_salt_service::handlers::get_metrics))
+        .route(
+            "/.well-known/jwks.json",
+            get(myso_salt_service::handlers::session_jwks),
+        )
+        .route(
+            "/auth/refresh",
+            post(myso_salt_service::handlers::auth_refresh),
+        )
+        .route(
+            "/auth/logout",
+            post(myso_salt_service::handlers::auth_logout),
+        );
 
     if !state.config.allowed_clients.is_empty() {
         router = router

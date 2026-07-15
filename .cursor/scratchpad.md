@@ -69,4 +69,33 @@ console.log('Salt ready for zkLogin:', saltBigInt.toString())
 - ✅ Salt format optimized for zkLogin
 - ✅ No hardcoded values (except mathematical constants)
 - ✅ Clean logging (only success/error messages)
-- ✅ Ready for production use 
+- ✅ Ready for production use
+
+---
+
+## Ed25519 Address Derivation and MySocial Auth (Mar 2025)
+
+**Implemented:**
+1. **Ed25519 address derivation** – `src/security/address_derivation.rs`: `derive_ed25519_address(sub, salt)` using SHA256 + Ed25519. Address format: `0x` + 64 hex chars (Sui-style).
+2. **Auth callback** – Returns `user: { address, email? }` with derived Ed25519 address.
+3. **MySocial Auth JWT** – Config: `MYSOCIAL_AUTH_ISSUER`, `MYSOCIAL_AUTH_JWKS_URI`, `ALLOWED_AUDIENCE_MYSOCIAL`. Handler accepts `{ "provider": "mysocial", "token": "<jwt>" }` or `{ "jwt": "<mysocial-jwt>" }` when issuer is configured.
+4. **Auth frontend** – `lib/address-derivation.ts`: `deriveEd25519AddressFromSubAndSalt(sub, salt)` for clients. Auth callback uses backend `user.address` when present, else derives locally from salt + id_token.
+
+**Security hardening (Mar 2025):**
+- Removed salt values from CRITICAL mismatch error log (was leaking hex-encoded salt)
+- Test endpoint: log only iss/aud, never sub/email/PII
+- User-identifier logs downgraded to debug level (reduces PII in default production logs)
+
+---
+
+## MySo Address Format Fix (Mar 2025)
+
+**Problem:** Backend derived raw hex of Ed25519 pubkey; frontend uses MySo-style `toMySoAddress()` (Blake2b of `0x00 || pubkey`). Addresses did not match.
+
+**Solution:** Integrated `myso-sdk-types` from myso-rust-sdk. `address_derivation.rs` now uses `Ed25519PublicKey::derive_address()` which implements `hash(0x00 || 32-byte pubkey)` → Address.
+
+**Changes:**
+- `Cargo.toml`: Added `myso-sdk-types = { path = "../myso-rust-sdk/crates/myso-sdk-types", features = ["hash"] }`
+- `address_derivation.rs`: Replaced `hex::encode(verifying_key.as_bytes())` with `Ed25519PublicKey::new(verifying_key.to_bytes()).derive_address().to_string()`
+
+**Verification:** All 10 unit tests + 2 integration tests pass. Backend-derived addresses now match frontend `keypair.getPublicKey().toMySoAddress()`.

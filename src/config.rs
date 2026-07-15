@@ -56,9 +56,11 @@ pub struct Config {
     pub mysocial_auth_jwks_uri: Option<String>,
     /// Canonical aud for MySocial Auth JWT validation (optional).
     pub allowed_audience_mysocial: Option<String>,
-    /// Base64-encoded HS256 secret for signing session access tokens (min 32 bytes).
+    /// Base64-encoded Ed25519 signing seed for session access tokens (at least 32 bytes).
     /// When set, auth callbacks return session_access_token and refresh_token.
     pub jwt_signing_key: Option<String>,
+    /// Public key identifier included in session JWTs and the published JWKS.
+    pub jwt_key_id: String,
     /// Issuer claim for session JWTs (e.g. https://salt.mysocial.network).
     pub jwt_issuer: Option<String>,
 }
@@ -130,6 +132,8 @@ impl Config {
             mysocial_auth_jwks_uri: env::var("MYSOCIAL_AUTH_JWKS_URI").ok(),
             allowed_audience_mysocial: env::var("ALLOWED_AUDIENCE_MYSOCIAL").ok(),
             jwt_signing_key: env::var("JWT_SIGNING_KEY").ok(),
+            jwt_key_id: env::var("JWT_KEY_ID")
+                .unwrap_or_else(|_| "mysocial-salt".to_string()),
             jwt_issuer: env::var("JWT_ISSUER")
                 .ok()
                 .or_else(|| Some("https://salt.testnet.mysocial.network".to_string())),
@@ -146,6 +150,20 @@ impl Config {
 
         if seed.len() < 32 {
             anyhow::bail!("MASTER_SEED must be at least 32 bytes");
+        }
+
+        if let Some(signing_key) = self.jwt_signing_key.as_ref() {
+            let decoded = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                signing_key,
+            )
+            .context("Invalid JWT_SIGNING_KEY base64")?;
+            if decoded.len() < 32 {
+                anyhow::bail!("JWT_SIGNING_KEY must decode to at least 32 bytes");
+            }
+            if self.jwt_key_id.trim().is_empty() {
+                anyhow::bail!("JWT_KEY_ID must not be empty when JWT_SIGNING_KEY is set");
+            }
         }
 
         // Validate database URL
@@ -417,8 +435,8 @@ mod tests {
             mysocial_auth_jwks_uri: None,
             allowed_audience_mysocial: None,
             jwt_signing_key: None,
+            jwt_key_id: "mysocial-salt".into(),
             jwt_issuer: None,
         }
     }
 }
-
