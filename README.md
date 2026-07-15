@@ -147,7 +147,8 @@ APPLE_TEAM_ID=<your-apple-team-id>
 APPLE_KEY_IDENTIFIER=<your-apple-key-id>
 APPLE_PRIVATE_KEY=<your-apple-private-key-pem>
 
-# MySocial platform sessions. JWT_SIGNING_KEY is a base64 Ed25519 seed (32 bytes minimum).
+# Required MySocial platform sessions. Startup fails if signing is unavailable.
+# Generate JWT_SIGNING_KEY once with: openssl rand -base64 32
 JWT_SIGNING_KEY=<base64-ed25519-private-seed>
 JWT_ISSUER=https://salt.testnet.mysocial.network
 JWT_KEY_ID=mysocial-salt

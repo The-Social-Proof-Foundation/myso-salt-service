@@ -152,18 +152,29 @@ impl Config {
             anyhow::bail!("MASTER_SEED must be at least 32 bytes");
         }
 
-        if let Some(signing_key) = self.jwt_signing_key.as_ref() {
-            let decoded = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                signing_key,
-            )
-            .context("Invalid JWT_SIGNING_KEY base64")?;
-            if decoded.len() < 32 {
-                anyhow::bail!("JWT_SIGNING_KEY must decode to at least 32 bytes");
-            }
-            if self.jwt_key_id.trim().is_empty() {
-                anyhow::bail!("JWT_KEY_ID must not be empty when JWT_SIGNING_KEY is set");
-            }
+        let signing_key = self
+            .jwt_signing_key
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .context("JWT_SIGNING_KEY must be set so every authentication returns a MySocial session")?;
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            signing_key,
+        )
+        .context("Invalid JWT_SIGNING_KEY base64")?;
+        if decoded.len() < 32 {
+            anyhow::bail!("JWT_SIGNING_KEY must decode to at least 32 bytes");
+        }
+        if self.jwt_key_id.trim().is_empty() {
+            anyhow::bail!("JWT_KEY_ID must not be empty");
+        }
+        if self
+            .jwt_issuer
+            .as_ref()
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+        {
+            anyhow::bail!("JWT_ISSUER must not be empty");
         }
 
         // Validate database URL
@@ -302,6 +313,10 @@ mod tests {
         c.database_url = "postgresql://localhost/db".into();
         c.allowed_audience_google = Some("g".into());
         c.allowed_audience_apple = Some("a".into());
+        c.jwt_signing_key = Some(
+            base64::engine::general_purpose::STANDARD.encode([1u8; 32]),
+        );
+        c.jwt_issuer = Some("https://salt.test.example".into());
         c
     }
 
@@ -329,6 +344,17 @@ mod tests {
             ..empty_shell()
         });
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_requires_session_signing() {
+        let mut c = minimal_config(empty_shell());
+        c.jwt_signing_key = None;
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("JWT_SIGNING_KEY must be set"));
     }
 
     #[test]

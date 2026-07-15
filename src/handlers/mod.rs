@@ -657,6 +657,13 @@ pub async fn auth_provider_callback(
     }
     let user = Some(serde_json::Value::Object(user_obj));
 
+    if state.config.jwt_signing_key.is_none() || state.config.jwt_issuer.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MySocial session signing is not configured".to_string(),
+        ));
+    }
+
     let (session_access_token, refresh_token, expires_in) =
         if let (Some(ref key_b64), Some(ref issuer)) =
             (&state.config.jwt_signing_key, &state.config.jwt_issuer)
@@ -772,6 +779,13 @@ pub async fn auth_wallet_callback(
 
     let mut user_obj = serde_json::Map::new();
     user_obj.insert("address".to_string(), serde_json::Value::String(request.address.clone()));
+
+    if state.config.jwt_signing_key.is_none() || state.config.jwt_issuer.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MySocial session signing is not configured".to_string(),
+        ));
+    }
 
     let (session_access_token, refresh_token, expires_in) =
         if let (Some(ref key_b64), Some(ref issuer)) =
