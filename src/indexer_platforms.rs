@@ -9,6 +9,7 @@ const ACTIVE_PLATFORMS_QUERY: &str = r#"query ActivePlatforms($limit: Int, $offs
   platforms(approvedOnly: true, limit: $limit, offset: $offset) {
     platformId
     statusText
+    redirectUri
     links
   }
 }"#;
@@ -39,6 +40,8 @@ struct PlatformRow {
     #[allow(dead_code)]
     developer_address: Option<String>,
     status_text: Option<String>,
+    #[allow(dead_code)]
+    redirect_uri: Option<String>,
     #[allow(dead_code)]
     shutdown_date: Option<serde_json::Value>,
     links: Option<serde_json::Value>,
@@ -95,6 +98,20 @@ pub fn redirect_uri_from_links(links: Option<&serde_json::Value>, keys: &[String
         }
     }
     None
+}
+
+pub fn resolve_platform_redirect_uri(
+    redirect_uri: Option<&str>,
+    links: Option<&serde_json::Value>,
+    keys: &[String],
+) -> Option<String> {
+    if let Some(uri) = redirect_uri {
+        let trimmed = uri.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    redirect_uri_from_links(links, keys)
 }
 
 pub async fn fetch_allowed_clients_from_indexer(
@@ -176,7 +193,11 @@ pub async fn fetch_allowed_clients_from_indexer(
                 continue;
             }
 
-            let redirect = redirect_uri_from_links(row.links.as_ref(), &cfg.platform_links_redirect_keys);
+            let redirect = resolve_platform_redirect_uri(
+                row.redirect_uri.as_deref(),
+                row.links.as_ref(),
+                &cfg.platform_links_redirect_keys,
+            );
             if cfg.require_redirect_uri_from_links && redirect.is_none() {
                 tracing::debug!(
                     platform_id = ?row.platform_id,
@@ -269,6 +290,31 @@ mod tests {
     }
 
     #[test]
+    fn redirect_from_on_chain_field() {
+        let links = serde_json::json!({ "website": "https://links.example/cb" });
+        let keys = vec!["website".into()];
+        assert_eq!(
+            resolve_platform_redirect_uri(
+                Some("https://onchain.example/cb"),
+                Some(&links),
+                &keys,
+            )
+            .as_deref(),
+            Some("https://onchain.example/cb")
+        );
+    }
+
+    #[test]
+    fn redirect_falls_back_to_links_when_on_chain_missing() {
+        let links = serde_json::json!({ "website": "https://links.example/cb" });
+        let keys = vec!["website".into()];
+        assert_eq!(
+            resolve_platform_redirect_uri(None, Some(&links), &keys).as_deref(),
+            Some("https://links.example/cb")
+        );
+    }
+
+    #[test]
     fn redirect_from_links_ordered_keys() {
         let links = serde_json::json!({
             "website": "https://one.test/callback",
@@ -326,11 +372,16 @@ mod tests {
             name: None,
             developer_address: None,
             status_text: Some("Live".into()),
+            redirect_uri: None,
             shutdown_date: None,
             links: None,
         };
         let cfg = test_config(None);
-        let redirect = redirect_uri_from_links(row.links.as_ref(), &cfg.platform_links_redirect_keys);
+        let redirect = resolve_platform_redirect_uri(
+            row.redirect_uri.as_deref(),
+            row.links.as_ref(),
+            &cfg.platform_links_redirect_keys,
+        );
         let has_global_callback = cfg
             .auth_callback_url
             .as_ref()

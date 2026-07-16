@@ -126,6 +126,7 @@ ALLOWED_CLIENTS='[{"client_id":"mysocial-auth-client-id","redirect_uri":"http://
 AUTH_CALLBACK_URL=https://auth.testnet.mysocial.network/callback
 
 # MySo indexer GraphQL — optional. Fetches `platforms(approvedOnly: true, limit, offset)`.
+# Uses on-chain `redirectUri` when set; falls back to `links` keys from `PLATFORM_LINKS_REDIRECT_KEYS`.
 # Merges with ALLOWED_CLIENTS; env wins on duplicate platformId/client_id.
 # Startup fails if the URL is set and the GraphQL request errors (HTTP or top-level errors).
 # If unset, only ALLOWED_CLIENTS is used.
@@ -168,7 +169,7 @@ Validates the salt service is ready (DB connectivity, salt derivation). Returns 
 ### POST /auth/provider/callback
 OAuth callback endpoint. Receives `{ client_id, code, provider?, state?, nonce?, code_verifier?, redirect_uri? }`. Looks up `client_id` in the merged list: indexer platforms (`platformId`) plus `ALLOWED_CLIENTS`, with env overriding duplicates. Token exchange uses `redirect_uri` from the request when valid, else each client’s stored `redirect_uri`, else `AUTH_CALLBACK_URL`. Exchanges code for tokens in-band (Google, Apple, Facebook, Twitch), fetches salt, returns `{ code, user?, salt, access_token? }`. Routes register when the merged allowlist is non-empty.
 
-Register OAuth redirect URIs in Google (etc.) to match the exact `redirect_uri` used for that client — often from indexer `links` JSON keys configured via `PLATFORM_LINKS_REDIRECT_KEYS`.
+Register OAuth redirect URIs in Google (etc.) to match the exact `redirect_uri` used for that client — from on-chain `redirectUri` when indexed, else from `links` via `PLATFORM_LINKS_REDIRECT_KEYS`.
 
 ### GET /.well-known/jwks.json
 
