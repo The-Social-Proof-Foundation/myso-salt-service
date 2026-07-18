@@ -40,7 +40,8 @@ pub struct Config {
     pub auth_callback_url: Option<String>,
     /// OAuth clients from `ALLOWED_CLIENTS` env JSON (merged with indexer in `main` when indexer URL is set).
     pub allowed_clients_env: Vec<AllowedClient>,
-    /// Final allowlist after merging indexer platforms with `allowed_clients_env` (env wins on duplicate `client_id`).
+    /// Final allowlist after merging indexer platforms with `allowed_clients_env`
+    /// (keyed by `client_id` + normalized redirect URI; env wins on the same key).
     pub allowed_clients: Vec<AllowedClient>,
     /// My indexer GraphQL HTTP endpoint. When set, platforms are fetched at startup and merged with env.
     pub myso_indexer_graphql_url: Option<String>,

@@ -47,16 +47,43 @@ struct PlatformRow {
     links: Option<serde_json::Value>,
 }
 
-/// Merge indexer clients with env `ALLOWED_CLIENTS`. Env wins on duplicate `client_id`.
+/// Normalize redirect URI for allowlist keys (trim, drop hash, strip trailing slash).
+pub fn normalize_redirect_uri(uri: &str) -> String {
+    let trimmed = uri.trim();
+    let without_hash = trimmed
+        .split_once('#')
+        .map(|(before, _)| before)
+        .unwrap_or(trimmed)
+        .trim();
+    without_hash.trim_end_matches('/').to_string()
+}
+
+fn merge_key(client: &AllowedClient) -> String {
+    format!(
+        "{}\0{}",
+        client.client_id,
+        normalize_redirect_uri(&client.redirect_uri)
+    )
+}
+
+/// Merge indexer clients with env `ALLOWED_CLIENTS`.
+/// Dedupes by `client_id` + normalized `redirect_uri` so the same client may keep many URIs.
+/// Env overwrites indexer on the same key.
 pub fn merge_allowed_clients(indexer: Vec<AllowedClient>, env: Vec<AllowedClient>) -> Vec<AllowedClient> {
     use std::collections::HashMap;
-    let mut map: HashMap<String, AllowedClient> =
-        indexer.into_iter().map(|c| (c.client_id.clone(), c)).collect();
+    let mut map: HashMap<String, AllowedClient> = HashMap::new();
+    for c in indexer {
+        map.insert(merge_key(&c), c);
+    }
     for c in env {
-        map.insert(c.client_id.clone(), c);
+        map.insert(merge_key(&c), c);
     }
     let mut out: Vec<_> = map.into_values().collect();
-    out.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+    out.sort_by(|a, b| {
+        a.client_id
+            .cmp(&b.client_id)
+            .then_with(|| a.redirect_uri.cmp(&b.redirect_uri))
+    });
     out
 }
 
@@ -78,11 +105,21 @@ pub(crate) fn platform_passes_status_filter(
 }
 
 pub fn redirect_uri_from_links(links: Option<&serde_json::Value>, keys: &[String]) -> Option<String> {
-    let links = links?;
+    redirect_uris_from_links(links, keys).into_iter().next()
+}
+
+/// All non-empty redirect URIs under configured link keys (order preserved).
+pub fn redirect_uris_from_links(links: Option<&serde_json::Value>, keys: &[String]) -> Vec<String> {
+    let Some(links) = links else {
+        return Vec::new();
+    };
     if keys.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let obj = links.as_object()?;
+    let Some(obj) = links.as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
     for key in keys {
         let k = key.trim();
         if k.is_empty() {
@@ -92,12 +129,42 @@ pub fn redirect_uri_from_links(links: Option<&serde_json::Value>, keys: &[String
             if let Some(s) = v.as_str() {
                 let t = s.trim();
                 if !t.is_empty() {
-                    return Some(t.to_string());
+                    out.push(t.to_string());
                 }
             }
         }
     }
-    None
+    out
+}
+
+/// Every redirect URI found for a platform: on-chain field plus all matching link keys.
+/// Deduped by normalized URI; original strings preserved in discovery order.
+pub fn collect_platform_redirect_uris(
+    redirect_uri: Option<&str>,
+    links: Option<&serde_json::Value>,
+    keys: &[String],
+) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut push = |raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let normalized = normalize_redirect_uri(trimmed);
+        if seen.insert(normalized) {
+            out.push(trimmed.to_string());
+        }
+    };
+
+    if let Some(uri) = redirect_uri {
+        push(uri);
+    }
+    for from_link in redirect_uris_from_links(links, keys) {
+        push(&from_link);
+    }
+    out
 }
 
 pub fn resolve_platform_redirect_uri(
@@ -105,13 +172,9 @@ pub fn resolve_platform_redirect_uri(
     links: Option<&serde_json::Value>,
     keys: &[String],
 ) -> Option<String> {
-    if let Some(uri) = redirect_uri {
-        let trimmed = uri.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    redirect_uri_from_links(links, keys)
+    collect_platform_redirect_uris(redirect_uri, links, keys)
+        .into_iter()
+        .next()
 }
 
 pub async fn fetch_allowed_clients_from_indexer(
@@ -193,12 +256,12 @@ pub async fn fetch_allowed_clients_from_indexer(
                 continue;
             }
 
-            let redirect = resolve_platform_redirect_uri(
+            let redirects = collect_platform_redirect_uris(
                 row.redirect_uri.as_deref(),
                 row.links.as_ref(),
                 &cfg.platform_links_redirect_keys,
             );
-            if cfg.require_redirect_uri_from_links && redirect.is_none() {
+            if cfg.require_redirect_uri_from_links && redirects.is_empty() {
                 tracing::debug!(
                     platform_id = ?row.platform_id,
                     "skipping platform (no redirect URL in links for configured keys)"
@@ -211,7 +274,7 @@ pub async fn fetch_allowed_clients_from_indexer(
                 .as_ref()
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false);
-            if redirect.is_none() && !has_global_callback {
+            if redirects.is_empty() && !has_global_callback {
                 tracing::debug!(
                     platform_id = ?row.platform_id,
                     "skipping platform (no redirect URI and AUTH_CALLBACK_URL not configured)"
@@ -219,16 +282,25 @@ pub async fn fetch_allowed_clients_from_indexer(
                 continue;
             }
 
-            let redirect_uri = redirect.unwrap_or_default();
             let Some(pid) = row.platform_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
                 continue;
             };
             let client_id = pid.to_string();
 
-            out.push(AllowedClient {
-                client_id,
-                redirect_uri,
-            });
+            if redirects.is_empty() {
+                // AUTH_CALLBACK_URL present: keep a row so client_id is known.
+                out.push(AllowedClient {
+                    client_id,
+                    redirect_uri: String::new(),
+                });
+            } else {
+                for redirect_uri in redirects {
+                    out.push(AllowedClient {
+                        client_id: client_id.clone(),
+                        redirect_uri,
+                    });
+                }
+            }
         }
 
         if (page_len as u32) < limit {
@@ -245,7 +317,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merge_env_overrides_indexer() {
+    fn merge_env_overrides_same_client_and_uri() {
         let indexer = vec![
             AllowedClient {
                 client_id: "a".into(),
@@ -258,12 +330,69 @@ mod tests {
         ];
         let env = vec![AllowedClient {
             client_id: "a".into(),
-            redirect_uri: "https://override/cb".into(),
+            redirect_uri: "https://a.example/cb/".into(),
         }];
         let m = merge_allowed_clients(indexer, env);
         assert_eq!(m.len(), 2);
         let a = m.iter().find(|c| c.client_id == "a").unwrap();
-        assert_eq!(a.redirect_uri, "https://override/cb");
+        // Env wins on same normalized key; preserves env's original string.
+        assert_eq!(a.redirect_uri, "https://a.example/cb/");
+    }
+
+    #[test]
+    fn merge_keeps_multiple_redirects_for_same_client_id() {
+        let indexer = vec![AllowedClient {
+            client_id: "a".into(),
+            redirect_uri: "https://onchain.example/cb".into(),
+        }];
+        let env = vec![
+            AllowedClient {
+                client_id: "a".into(),
+                redirect_uri: "https://prod.example/auth/callback".into(),
+            },
+            AllowedClient {
+                client_id: "a".into(),
+                redirect_uri: "http://localhost:3000/auth/callback".into(),
+            },
+        ];
+        let m = merge_allowed_clients(indexer, env);
+        assert_eq!(m.len(), 3);
+        let uris: Vec<_> = m
+            .iter()
+            .filter(|c| c.client_id == "a")
+            .map(|c| c.redirect_uri.as_str())
+            .collect();
+        assert!(uris.contains(&"https://onchain.example/cb"));
+        assert!(uris.contains(&"https://prod.example/auth/callback"));
+        assert!(uris.contains(&"http://localhost:3000/auth/callback"));
+    }
+
+    #[test]
+    fn collect_keeps_on_chain_and_all_link_keys() {
+        let links = serde_json::json!({
+            "website": "https://www.example.com/auth/callback",
+            "url": "https://example.com/auth/callback",
+            "oauthRedirect": "http://localhost:3000/auth/callback"
+        });
+        let keys = vec![
+            "website".into(),
+            "url".into(),
+            "oauthRedirect".into(),
+        ];
+        let uris = collect_platform_redirect_uris(
+            Some("https://onchain.example/callback/"),
+            Some(&links),
+            &keys,
+        );
+        assert_eq!(
+            uris,
+            vec![
+                "https://onchain.example/callback/",
+                "https://www.example.com/auth/callback",
+                "https://example.com/auth/callback",
+                "http://localhost:3000/auth/callback",
+            ]
+        );
     }
 
     #[test]
