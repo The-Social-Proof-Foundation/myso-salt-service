@@ -7,6 +7,7 @@ use tracing::{error, warn};
 use hex;
 
 use chrono::Utc;
+use serde::Deserialize;
 
 use crate::{
     config::resolve_oauth_redirect_uri_for_token_exchange,
@@ -647,6 +648,51 @@ fn bounded(value: &str, label: &str) -> Result<(), (StatusCode, String)> {
 fn is_wallet_address(value: &str) -> bool {
     let rest = value.strip_prefix("0x").unwrap_or("");
     rest.len() == 64 && rest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+#[derive(Deserialize)]
+pub struct PutZkLoginSaltRequest {
+    salt: String,
+    iss: String,
+    aud: String,
+}
+
+pub async fn get_zklogin_salt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let subject = authenticated_subject(&state, &headers).await?;
+    let row = state.store.get_zklogin_salt(&subject).await.map_err(|e| {
+        error!("Failed to load zkLogin salt: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())
+    })?;
+    let Some((salt, iss, aud)) = row else {
+        return Err((StatusCode::NOT_FOUND, "No zkLogin salt".to_string()));
+    };
+    Ok(Json(serde_json::json!({ "salt": salt, "iss": iss, "aud": aud })))
+}
+
+pub async fn put_zklogin_salt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PutZkLoginSaltRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let subject = authenticated_subject(&state, &headers).await?;
+    if request.salt.trim().is_empty() || request.iss.trim().is_empty() || request.aud.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "salt, iss, and aud are required".to_string()));
+    }
+    let inserted = state
+        .store
+        .insert_zklogin_salt(&subject, request.salt.trim(), request.iss.trim(), request.aud.trim())
+        .await
+        .map_err(|e| {
+            error!("Failed to store zkLogin salt: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())
+        })?;
+    if !inserted {
+        return Err((StatusCode::CONFLICT, "zkLogin salt already exists".to_string()));
+    }
+    Ok(StatusCode::CREATED)
 }
 
 pub async fn wallet_vault_challenge(

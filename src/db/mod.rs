@@ -387,6 +387,37 @@ impl SaltStore {
         .context("Failed to attach wallet address to refresh sessions")?;
         Ok(())
     }
+
+    pub async fn get_zklogin_salt(&self, user_identifier: &str) -> Result<Option<(String, String, String)>> {
+        let row = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT salt, iss, aud FROM zklogin_salts WHERE user_identifier = $1",
+        )
+        .bind(user_identifier)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to load zkLogin salt")?;
+        Ok(row)
+    }
+
+    pub async fn insert_zklogin_salt(
+        &self,
+        user_identifier: &str,
+        salt: &str,
+        iss: &str,
+        aud: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "INSERT INTO zklogin_salts (user_identifier, salt, iss, aud) VALUES ($1, $2, $3, $4) ON CONFLICT (user_identifier) DO NOTHING",
+        )
+        .bind(user_identifier)
+        .bind(salt)
+        .bind(iss)
+        .bind(aud)
+        .execute(&self.pool)
+        .await
+        .context("Failed to store zkLogin salt")?;
+        Ok(result.rows_affected() == 1)
+    }
 }
 
 // Integration tests for DB live under `tests/` and require a live database.

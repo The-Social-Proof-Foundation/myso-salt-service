@@ -170,6 +170,11 @@ fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
                 .put(myso_salt_service::handlers::put_wallet_vault),
         )
         .route(
+            "/zklogin-salt",
+            get(myso_salt_service::handlers::get_zklogin_salt)
+                .put(myso_salt_service::handlers::put_zklogin_salt),
+        )
+        .route(
             "/.well-known/jwks.json",
             get(myso_salt_service::handlers::session_jwks),
         )
