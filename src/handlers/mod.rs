@@ -661,6 +661,20 @@ pub async fn post_zklogin_address(
     Json(request): Json<PostZkLoginAddressRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let subject = authenticated_subject(&state, &headers).await?;
+    let Some((salt, iss, aud)) = state.store.get_zklogin_salt(&subject).await.map_err(|e| {
+        error!("Failed to load zkLogin salt for address bind: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())
+    })?
+    else {
+        return Err((StatusCode::NOT_FOUND, "No zkLogin salt".to_string()));
+    };
+    let prefix = format!("{iss}:");
+    if salt.is_empty() || aud.is_empty() || !subject.starts_with(&prefix) || subject.len() == prefix.len() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Session does not match this zkLogin account".to_string(),
+        ));
+    }
     let address = request.address.trim().to_lowercase();
     if !is_wallet_address(&address) {
         return Err((StatusCode::BAD_REQUEST, "address must be a chain address".to_string()));
