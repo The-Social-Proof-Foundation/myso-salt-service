@@ -175,6 +175,10 @@ fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
                 .put(myso_salt_service::handlers::put_zklogin_salt),
         )
         .route(
+            "/zklogin-address",
+            post(myso_salt_service::handlers::post_zklogin_address),
+        )
+        .route(
             "/.well-known/jwks.json",
             get(myso_salt_service::handlers::session_jwks),
         )

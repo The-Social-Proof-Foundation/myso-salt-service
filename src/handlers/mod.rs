@@ -651,6 +651,32 @@ fn is_wallet_address(value: &str) -> bool {
 }
 
 #[derive(Deserialize)]
+pub struct PostZkLoginAddressRequest {
+    address: String,
+}
+
+pub async fn post_zklogin_address(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PostZkLoginAddressRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let subject = authenticated_subject(&state, &headers).await?;
+    let address = request.address.trim().to_lowercase();
+    if !is_wallet_address(&address) {
+        return Err((StatusCode::BAD_REQUEST, "address must be a chain address".to_string()));
+    }
+    state
+        .store
+        .set_refresh_wallet_address(&subject, &address)
+        .await
+        .map_err(|e| {
+            error!("Failed to attach zkLogin address: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Session update failed".to_string())
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
 pub struct PutZkLoginSaltRequest {
     salt: String,
     iss: String,
