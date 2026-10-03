@@ -4,7 +4,6 @@ use axum::{
     routing::{get, post},
     http::{header, Method},
 };
-use base64::{Engine as _, engine::general_purpose};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::signal;
 use tower_http::{
@@ -21,7 +20,7 @@ use myso_salt_service::{
     indexer_platforms::{self, merge_allowed_clients},
     monitoring::Metrics,
     state::AppState,
-    security::{SaltManager, jwt::JwtValidator, access_token::AccessTokenValidator},
+    security::{jwt::JwtValidator, access_token::AccessTokenValidator},
 };
 
 #[tokio::main]
@@ -35,7 +34,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    info!("Starting the MySocial Salt Service");
+    info!("Starting the MySocial auth service");
 
     // Load configuration
     let mut config = Config::from_env()?;
@@ -79,12 +78,6 @@ async fn main() -> Result<()> {
     let config = Arc::new(config);
     info!("Configuration loaded successfully");
 
-    // Decode master seed
-    let master_seed = general_purpose::STANDARD
-        .decode(&config.master_seed_base64)
-        .context("Failed to decode master seed")?;
-
-    // Initialize components
     let store = SaltStore::new(&config.database_url).await?;
     info!("Database connection established");
 
@@ -92,7 +85,6 @@ async fn main() -> Result<()> {
     run_migrations(&store).await?;
     info!("Database migrations completed");
 
-    let salt_manager = Arc::new(SaltManager::new(master_seed)?);
     let jwt_validator = Arc::new(JwtValidator::new(
         config.allowed_audience_google.clone(),
         config.allowed_audience_apple.clone(),
@@ -116,7 +108,6 @@ async fn main() -> Result<()> {
     let state = AppState {
         config: config.clone(),
         store,
-        salt_manager,
         jwt_validator,
         access_token_validator,
         metrics,

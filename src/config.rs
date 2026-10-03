@@ -11,7 +11,6 @@ pub struct AllowedClient {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub database_url: String,
-    pub master_seed_base64: String,
     pub port: u16,
     pub allowed_origins: Vec<String>,
     pub rate_limit_per_minute: i32,
@@ -74,8 +73,6 @@ impl Config {
         Ok(Config {
             database_url: env::var("DATABASE_URL")
                 .context("DATABASE_URL not set")?,
-            master_seed_base64: env::var("MASTER_SEED")
-                .context("MASTER_SEED not set")?,
             port: env::var("PORT")
                 .unwrap_or_else(|_| "3000".to_string())
                 .parse()
@@ -143,16 +140,6 @@ impl Config {
 
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
-        // Validate master seed
-        let seed = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &self.master_seed_base64
-        ).context("Invalid MASTER_SEED base64")?;
-
-        if seed.len() < 32 {
-            anyhow::bail!("MASTER_SEED must be at least 32 bytes");
-        }
-
         let signing_key = self
             .jwt_signing_key
             .as_ref()
@@ -310,7 +297,6 @@ mod tests {
     use base64::Engine;
 
     fn minimal_config(mut c: Config) -> Config {
-        c.master_seed_base64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
         c.database_url = "postgresql://localhost/db".into();
         c.allowed_audience_google = Some("g".into());
         c.allowed_audience_apple = Some("a".into());
@@ -432,7 +418,6 @@ mod tests {
     fn empty_shell() -> Config {
         Config {
             database_url: String::new(),
-            master_seed_base64: String::new(),
             port: 3000,
             allowed_origins: vec![],
             rate_limit_per_minute: 60,

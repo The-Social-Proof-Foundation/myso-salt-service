@@ -1,35 +1,33 @@
- # MySocial Salt Service
+ # MySocial Auth Service
 
-A production-ready salt backup service for zkLogin.
+OAuth identity and encrypted wallet-vault storage. The service never derives or stores a wallet signing key.
 
 ## Overview
 
-This service provides secure salt generation and storage for zkLogin authentication, ensuring that:
-- User identities remain private and cannot be traced back to Web2 credentials
-- Salts are deterministically generated per user (consistent across platforms)
-- All operations are audited and rate-limited
-- Data is encrypted at rest
+This service:
+- Verifies Google, Apple, Facebook, and Twitch logins and issues a MySocial session
+- Stores only ciphertext for a wallet vault, keyed by the authenticated subject
+- Rate-limits requests
 
 ## Features
 
-- **Secure Salt Generation**: Deterministic salt generation using SHA-256 with domain separation
-- **Encryption at Rest**: ChaCha20-Poly1305 encryption for stored salts
+- **OAuth identity only**: Provider tokens prove who the user is. They are not turned into a wallet key
+- **Opaque vault storage**: `wallet_vaults` holds ciphertext the client encrypted. The server cannot open it
 - **Multi-Provider Authentication**: Support for Google, Apple, Facebook, and Twitch OAuth providers
 - **Flexible Token Formats**: Accepts both JWT tokens (Google/Apple) and access tokens (Facebook/Twitch)
 - **Rate Limiting**: IP-based rate limiting to prevent abuse
-- **Audit Logging**: Comprehensive audit trail for all operations
 - **Health Monitoring**: Built-in health checks and metrics endpoints
 - **Production Ready**: Graceful shutdown, structured logging, and error handling
 
 ## Related services
 
-**Identity verification is intentionally not part of this service.** X/Twitter verification, ecosystem badges, share campaigns, and social graph import live in [`myso-identity-verification`](https://github.com/the-social-proof-foundation/myso-identity-verification) (`identity-verification.mysocial.network`). This salt service handles authentication only: OAuth salt backup, session tokens, and wallet address derivation.
+**Identity verification is intentionally not part of this service.** X/Twitter verification, ecosystem badges, share campaigns, and social graph import live in [`myso-identity-verification`](https://github.com/the-social-proof-foundation/myso-identity-verification) (`identity-verification.mysocial.network`). This service handles authentication only: OAuth sessions and opaque wallet-vault storage.
 
 ## Architecture
 
 ```
 ┌─────────────┐     JWT      ┌──────────────┐
-│   Client    │─────────────▶│ Salt Service │
+│   Client    │─────────────▶│ Auth Service │
 └─────────────┘              └──────┬───────┘
                                     │
                               ┌─────▼───────┐
@@ -52,23 +50,18 @@ This service provides secure salt generation and storage for zkLogin authenticat
    cd myso-salt-service
    ```
 
-2. **Generate a master seed**
-   ```bash
-   cargo run --bin generate_seed
-   ```
-
-3. **Set up environment variables**
+2. **Set up environment variables**
    ```bash
    cp .env.example .env
    # Edit .env with your configuration
    ```
 
-4. **Run database migrations**
+3. **Run database migrations**
    ```bash
    cargo sqlx migrate run
    ```
 
-5. **Start the service**
+4. **Start the service**
    ```bash
    cargo run
    ```
@@ -101,7 +94,6 @@ Set these in Railway dashboard:
 
 ```bash
 DATABASE_URL=<your-postgresql-url>
-MASTER_SEED=<base64-encoded-seed>
 PORT=3000
 ALLOWED_ORIGINS=https://wallet.mysocial.network
 RATE_LIMIT=60
@@ -164,11 +156,8 @@ railway up
 
 ## API Endpoints
 
-### GET /salt/check
-Validates the salt service is ready (DB connectivity, salt derivation). Returns `{ "status": "ready", "salt_endpoint": "/salt" }`.
-
 ### POST /auth/provider/callback
-OAuth callback endpoint. Receives `{ client_id, code, provider?, state?, nonce?, code_verifier?, redirect_uri? }`. Looks up `client_id` in the merged list: indexer platforms (`platformId`) plus `ALLOWED_CLIENTS` (same `client_id` may appear with multiple consumer `redirect_uri`s; any matching row is enough). Token exchange uses `redirect_uri` from the request when valid, else each client’s stored `redirect_uri`, else `AUTH_CALLBACK_URL`. Exchanges code for tokens in-band (Google, Apple, Facebook, Twitch), fetches salt, returns `{ code, user?, salt, access_token? }`. Routes register when the merged allowlist is non-empty.
+OAuth callback endpoint. Receives `{ client_id, code, provider?, state?, nonce?, code_verifier?, redirect_uri? }`. Looks up `client_id` in the merged list: indexer platforms (`platformId`) plus `ALLOWED_CLIENTS` (same `client_id` may appear with multiple consumer `redirect_uri`s; any matching row is enough). Token exchange uses `redirect_uri` from the request when valid, else each client’s stored `redirect_uri`, else `AUTH_CALLBACK_URL`. Exchanges code for tokens in-band (Google, Apple, Facebook, Twitch) and returns a MySocial session. Routes register when the merged allowlist is non-empty.
 
 Register OAuth redirect URIs in Google (etc.) to match the auth frontend callback (`AUTH_CALLBACK_URL`). Consumer allowlist URIs come from on-chain `redirectUri` plus all `PLATFORM_LINKS_REDIRECT_KEYS` values, merged with `ALLOWED_CLIENTS`.
 
@@ -188,63 +177,9 @@ user }`. Reuse of a revoked refresh token revokes the remaining session family.
 Revokes the supplied `{ refresh_token }`. The endpoint is idempotent so clients can always clear
 local credentials after the request.
 
-### POST /salt
-Get or create salt for a user.
+### GET /wallet-vault and PUT /wallet-vault
 
-**Request Format 1: JWT Token (Google, Apple)**
-```json
-{
-  "jwt": "eyJhbGciOiJSUzI1NiIs..."
-}
-```
-
-**Request Format 2: Provider + Access Token (Facebook, Twitch)**
-```json
-{
-  "provider": "facebook",
-  "token": "access_token_here"
-}
-```
-
-or
-
-```json
-{
-  "provider": "twitch",
-  "token": "access_token_here"
-}
-```
-
-**Request Format 3: MySocial Auth (provider + JWT)**
-```json
-{
-  "provider": "mysocial",
-  "token": "<mysocial-jwt>"
-}
-```
-
-MySocial JWTs can also use the JWT format when the issuer is configured: `{ "jwt": "<mysocial-jwt>" }`.
-
-**Supported Providers:**
-- `google` - **JWT format only** (`{ "jwt": "id_token" }`)
-- `apple` - **JWT format only** (`{ "jwt": "id_token" }`)
-- `facebook` - **Provider + token format** (`{ "provider": "facebook", "token": "access_token" }`)
-- `twitch` - **Provider + token format** (`{ "provider": "twitch", "token": "access_token" }`)
-- `mysocial` - **Provider + JWT format** (`{ "provider": "mysocial", "token": "<mysocial-jwt>" }`) – requires `MYSOCIAL_AUTH_ISSUER` and `MYSOCIAL_AUTH_JWKS_URI`
-
-**Important Notes:**
-- Google and Apple use JWT ID tokens and must use the `jwt` field format
-- Facebook and Twitch use OAuth access tokens and must use the `provider` + `token` format
-- Attempting to use Apple with `{ "provider": "apple", "token": "..." }` will return an error
-
-**Response:**
-```json
-{
-  "salt": "12345678901234567890123456789012"
-}
-```
-
-The salt is returned as a BigInt decimal string (for zkLogin compatibility).
+Reads and writes the opaque vault for the authenticated subject. The body is ciphertext. Possession of the wallet is proved to the service before a write; the service does not decrypt the vault.
 
 ### GET /health
 Health check endpoint.
@@ -268,8 +203,6 @@ Response:
   "requests_success": 950,
   "requests_failed": 50,
   "jwt_validations_failed": 30,
-  "salts_created": 100,
-  "salts_retrieved": 850,
   "rate_limits_hit": 20,
   "uptime_seconds": 86400,
   "start_time": "2024-01-01T00:00:00Z"
@@ -278,33 +211,21 @@ Response:
 
 ## Security Considerations
 
-1. **Master Seed Protection**
-   - Store in Railway's encrypted environment variables
-   - Never commit to version control
-   - Use different seeds for dev/staging/production
-   - Rotate every 90 days
-
-2. **Database Security**
+1. **Database Security**
    - Enable SSL/TLS connections
    - Use connection pooling
    - Regular backups
 
-3. **Network Security**
+2. **Network Security**
    - HTTPS only in production
    - Strict CORS policies
    - Rate limiting per IP
 
-4. **Monitoring**
+3. **Monitoring**
    - Set up alerts for failed JWT validations
    - Monitor rate limit violations
-   - Track salt creation patterns
 
 ## Recovery Procedures
-
-### Master Seed Recovery
-1. Keep encrypted backup of master seed in secure storage
-2. Document recovery process with multiple approvers
-3. Test recovery quarterly
 
 ### Database Recovery
 - Railway provides automatic daily backups
@@ -314,7 +235,7 @@ Response:
 ## Performance
 
 - Handles 1000+ requests/second
-- Sub-10ms response time for cached salts
+- Sub-10ms response time for session and vault reads
 - Automatic connection pooling
 - Efficient rate limiting with database cleanup
 

@@ -3,32 +3,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct UserSalt {
-    pub id: Uuid,
-    pub user_identifier: String,
-    pub iss: String,
-    pub aud: String,
-    pub sub: String,
-    pub encrypted_salt: Vec<u8>,
-    pub encryption_version: i32,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct AuditLogEntry {
-    pub id: Uuid,
-    pub user_identifier: String,
-    pub action_type: String,
-    pub ip_address: Option<String>,
-    pub user_agent: Option<String>,
-    pub jwt_hash: Option<String>,
-    pub success: bool,
-    pub error_message: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JwtClaims {
     pub iss: String,  // Issuer
@@ -272,25 +246,6 @@ pub struct HealthCheckResponse {
     pub status: String,
     pub timestamp: DateTime<Utc>,
     pub version: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ActionType {
-    Create,
-    Read,
-    Rotate,
-    Error,
-}
-
-impl ActionType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ActionType::Create => "CREATE",
-            ActionType::Read => "READ",
-            ActionType::Rotate => "ROTATE",
-            ActionType::Error => "ERROR",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

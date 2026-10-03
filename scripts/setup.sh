@@ -7,21 +7,6 @@ set -e
 echo "🚀 MySocial Salt Service Setup"
 echo "========================"
 
-# Check if master seed exists
-if [ -z "$MASTER_SEED" ]; then
-    echo ""
-    echo "⚠️  No MASTER_SEED found in environment"
-    echo "Generating a new master seed..."
-    echo ""
-    
-    cargo run --bin generate_seed
-    
-    echo ""
-    echo "Please set the MASTER_SEED environment variable with the generated value"
-    echo ""
-    exit 1
-fi
-
 # Check database URL
 if [ -z "$DATABASE_URL" ]; then
     echo "❌ DATABASE_URL environment variable not set"

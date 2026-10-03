@@ -459,7 +459,6 @@ mod tests {
     fn test_config(auth_callback_url: Option<&str>) -> Config {
         Config {
             database_url: "postgresql://localhost/db".into(),
-            master_seed_base64: String::new(),
             port: 3000,
             allowed_origins: vec![],
             rate_limit_per_minute: 60,

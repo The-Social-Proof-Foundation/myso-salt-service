@@ -12,14 +12,13 @@ use crate::{
     config::resolve_oauth_redirect_uri_for_token_exchange,
     auth::exchange,
     models::{
-        HealthCheckResponse, ActionType,
+        HealthCheckResponse,
         AuthCallbackRequest, AuthCallbackResponse, LogoutRequest, RefreshRequest,
         RefreshResponse, WalletAuthRequest, PutWalletVaultRequest, WalletVaultRecord,
         WalletVaultResponse, VaultChallengeResponse,
     },
     security::{
         jwt::JwtValidator,
-        hash_token_for_audit,
         session_token,
         wallet_signature,
     },
@@ -182,12 +181,9 @@ pub async fn auth_provider_callback(
         (StatusCode::BAD_GATEWAY, format!("Auth exchange failed: {}", e))
     })?;
 
-    let (claims, token_hash) = if let Some(ref id_token) = tokens.id_token {
+    let claims = if let Some(ref id_token) = tokens.id_token {
         match state.jwt_validator.validate(id_token).await {
-            Ok(c) => {
-                let hash = hash_token_for_audit(id_token);
-                (c, hash)
-            }
+            Ok(c) => c,
             Err(e) => {
                 error!("JWT validation failed after exchange: {}", e);
                 return Err((
@@ -227,10 +223,7 @@ pub async fn auth_provider_callback(
             .extract_claims_from_token(provider, access_token)
             .await
         {
-            Ok(c) => {
-                let hash = hash_token_for_audit(access_token);
-                (c, hash)
-            }
+            Ok(c) => c,
             Err(e) => {
                 error!("Access token validation failed: {}", e);
                 return Err((
@@ -272,16 +265,6 @@ pub async fn auth_provider_callback(
             (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())
         })?
         .map(|record| record.address);
-
-    let _ = state.store.log_audit(
-        &user_identifier,
-        ActionType::Read,
-        Some(addr.ip().to_string()),
-        None,
-        Some(token_hash),
-        true,
-        None,
-    ).await;
 
     let code = tokens
         .id_token
@@ -409,17 +392,6 @@ pub async fn auth_wallet_callback(
         })?;
 
     let user_identifier = format!("wallet:{}", request.address);
-
-    let _ = state.store.log_audit(
-        &user_identifier,
-        ActionType::Read,
-        Some(ip_address),
-        None,
-        Some(hash_token_for_audit(&request.signature)),
-        true,
-        None,
-    )
-    .await;
 
     let mut user_obj = serde_json::Map::new();
     user_obj.insert("address".to_string(), serde_json::Value::String(request.address.clone()));
