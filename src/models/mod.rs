@@ -155,7 +155,6 @@ pub struct AuthExchangeResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthCallbackResponse {
     pub code: String,
-    pub salt: String,
     pub id_token: Option<String>,
     pub user: Option<serde_json::Value>,
     pub access_token: Option<String>,
@@ -216,6 +215,56 @@ pub struct WalletAuthRequest {
     pub nonce: Option<String>,
     #[serde(rename = "request_id")]
     pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct WalletVaultRecord {
+    pub user_identifier: String,
+    pub address: String,
+    pub version: i32,
+    pub credential_id: Option<String>,
+    pub prf_salt: Option<String>,
+    pub prf_wrapped_wek: Option<String>,
+    pub recovery_wrapped_wek: String,
+    pub recovery_kdf_salt: String,
+    pub vault: String,
+    pub vault_hash: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PutWalletVaultRequest {
+    pub address: String,
+    pub version: i32,
+    pub credential_id: Option<String>,
+    pub prf_salt: Option<String>,
+    pub prf_wrapped_wek: Option<String>,
+    pub recovery_wrapped_wek: String,
+    pub recovery_kdf_salt: String,
+    pub vault: String,
+    pub nonce: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletVaultResponse {
+    pub address: String,
+    pub version: i32,
+    pub credential_id: Option<String>,
+    pub prf_salt: Option<String>,
+    pub prf_wrapped_wek: Option<String>,
+    pub recovery_wrapped_wek: String,
+    pub recovery_kdf_salt: String,
+    pub vault: String,
+    pub vault_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VaultChallengeResponse {
+    pub nonce: String,
+    pub expires_in: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -441,6 +441,118 @@ impl SaltStore {
 
         Ok(result.rows_affected())
     }
+
+    pub async fn insert_vault_challenge(
+        &self,
+        nonce: &str,
+        user_identifier: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO wallet_vault_challenges (nonce, user_identifier, expires_at)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(nonce)
+        .bind(user_identifier)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .context("Failed to store vault challenge")?;
+        Ok(())
+    }
+
+    /// Marks a challenge used. Returns false when it is missing, expired, reused, or bound to another user.
+    pub async fn consume_vault_challenge(&self, nonce: &str, user_identifier: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE wallet_vault_challenges
+            SET used_at = NOW()
+            WHERE nonce = $1
+              AND user_identifier = $2
+              AND used_at IS NULL
+              AND expires_at > NOW()
+            "#,
+        )
+        .bind(nonce)
+        .bind(user_identifier)
+        .execute(&self.pool)
+        .await
+        .context("Failed to consume vault challenge")?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn get_wallet_vault(
+        &self,
+        user_identifier: &str,
+    ) -> Result<Option<crate::models::WalletVaultRecord>> {
+        sqlx::query_as::<_, crate::models::WalletVaultRecord>(
+            r#"
+            SELECT user_identifier, address, version, credential_id, prf_salt, prf_wrapped_wek,
+                   recovery_wrapped_wek, recovery_kdf_salt, vault, vault_hash, updated_at
+            FROM wallet_vaults
+            WHERE user_identifier = $1
+            "#,
+        )
+        .bind(user_identifier)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to load wallet vault")
+    }
+
+    pub async fn upsert_wallet_vault(&self, record: &crate::models::WalletVaultRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO wallet_vaults (
+                user_identifier, address, version, credential_id, prf_salt, prf_wrapped_wek,
+                recovery_wrapped_wek, recovery_kdf_salt, vault, vault_hash, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            ON CONFLICT (user_identifier) DO UPDATE SET
+                address = EXCLUDED.address,
+                version = EXCLUDED.version,
+                credential_id = EXCLUDED.credential_id,
+                prf_salt = EXCLUDED.prf_salt,
+                prf_wrapped_wek = EXCLUDED.prf_wrapped_wek,
+                recovery_wrapped_wek = EXCLUDED.recovery_wrapped_wek,
+                recovery_kdf_salt = EXCLUDED.recovery_kdf_salt,
+                vault = EXCLUDED.vault,
+                vault_hash = EXCLUDED.vault_hash,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&record.user_identifier)
+        .bind(&record.address)
+        .bind(record.version)
+        .bind(&record.credential_id)
+        .bind(&record.prf_salt)
+        .bind(&record.prf_wrapped_wek)
+        .bind(&record.recovery_wrapped_wek)
+        .bind(&record.recovery_kdf_salt)
+        .bind(&record.vault)
+        .bind(&record.vault_hash)
+        .execute(&self.pool)
+        .await
+        .context("Failed to store wallet vault")?;
+        Ok(())
+    }
+
+    pub async fn set_refresh_wallet_address(
+        &self,
+        user_identifier: &str,
+        wallet_address: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE refresh_sessions SET wallet_address = $2 WHERE user_identifier = $1 AND expires_at > NOW()",
+        )
+        .bind(user_identifier)
+        .bind(wallet_address)
+        .execute(&self.pool)
+        .await
+        .context("Failed to attach wallet address to refresh sessions")?;
+        Ok(())
+    }
 }
 
 // Integration tests for DB live under `tests/` and require a live database.

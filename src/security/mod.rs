@@ -1,5 +1,4 @@
 pub mod access_token;
-pub mod address_derivation;
 pub mod jwt;
 pub mod session_token;
 pub mod wallet_signature;
@@ -10,16 +9,13 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
 };
 use rand::RngCore;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use base64::{Engine as _, engine::general_purpose};
-
-use crate::models::JwtClaims;
 
 const NONCE_SIZE: usize = 12;
 
 #[derive(Clone)]
 pub struct SaltManager {
-    master_seed: Vec<u8>,
     encryption_key: Key,
 }
 
@@ -38,31 +34,8 @@ impl SaltManager {
         let encryption_key = Key::from_slice(&key_bytes);
 
         Ok(Self {
-            master_seed,
             encryption_key: *encryption_key,
         })
-    }
-
-    /// Generate a deterministic salt from JWT claims
-    /// Returns exactly 16 bytes (128 bits) for zkLogin compatibility
-    ///
-    /// Uses iss + sub (stable per provider) to align with DB key and avoid
-    /// cross-provider sub collisions. aud is not included since we enforce
-    /// a single aud per provider; differing aud is rejected earlier in the flow.
-    pub fn generate_salt(&self, claims: &JwtClaims) -> Result<Vec<u8>> {
-        let mut hasher = <Sha256 as Digest>::new();
-
-        // Domain separation for versioning and server binding
-        hasher.update(b"MYSOCIAL_SALT_V1");
-        hasher.update(&self.master_seed);
-        hasher.update(claims.iss.as_bytes());
-        hasher.update(claims.sub.as_bytes());
-
-        let hash = hasher.finalize();
-
-        // Take exactly first 16 bytes for zkLogin compatibility (128 bits)
-        let salt = hash[..16].to_vec();
-        Ok(salt)
     }
 
     /// Encrypt salt for storage
@@ -133,32 +106,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_salt_generation_deterministic() {
-        let seed = generate_master_seed();
-        let manager = SaltManager::new(seed).unwrap();
-        
-        let claims = JwtClaims {
-            iss: "https://accounts.google.com".to_string(),
-            aud: "test-app".to_string(),
-            sub: "111631294628286022835".to_string(),
-            exp: 1234567890,
-            iat: 1234567890,
-            nonce: None,
-            email: None,
-            email_verified: None,
-            name: None,
-            picture: None,
-            given_name: None,
-            family_name: None,
-        };
-        
-        let salt1 = manager.generate_salt(&claims).unwrap();
-        let salt2 = manager.generate_salt(&claims).unwrap();
-        
-        assert_eq!(salt1, salt2, "Salt generation should be deterministic");
-    }
-
-    #[test]
     fn test_salt_encryption_decryption() {
         let seed = generate_master_seed();
         let manager = SaltManager::new(seed).unwrap();
@@ -168,89 +115,5 @@ mod tests {
         let decrypted = manager.decrypt_salt(&encrypted).unwrap();
         
         assert_eq!(salt.to_vec(), decrypted, "Encryption/decryption roundtrip should work");
-    }
-
-    #[test]
-    fn test_salt_same_across_platforms() {
-        let seed = generate_master_seed();
-        let manager = SaltManager::new(seed).unwrap();
-
-        // Same user sub, different audiences/issuers/timestamps
-        let claims_web = JwtClaims {
-            iss: "https://accounts.google.com".to_string(),
-            aud: "web-client-id".to_string(),
-            sub: "111631294628286022835".to_string(),
-            exp: 2000000000,
-            iat: 1500000000,
-            nonce: None,
-            email: None,
-            email_verified: None,
-            name: None,
-            picture: None,
-            given_name: None,
-            family_name: None,
-        };
-
-        let claims_ios = JwtClaims {
-            iss: "https://accounts.google.com".to_string(),
-            aud: "ios-client-id".to_string(),
-            sub: "111631294628286022835".to_string(),
-            exp: 2100000000,
-            iat: 1600000000,
-            nonce: Some("random".to_string()),
-            email: None,
-            email_verified: None,
-            name: None,
-            picture: None,
-            given_name: None,
-            family_name: None,
-        };
-
-        let salt_web = manager.generate_salt(&claims_web).unwrap();
-        let salt_ios = manager.generate_salt(&claims_ios).unwrap();
-
-        assert_eq!(salt_web, salt_ios, "Salts must match across platforms for same iss+sub (aud must match configured one in production)");
-    }
-
-    #[test]
-    fn test_salt_differs_across_issuers() {
-        let seed = generate_master_seed();
-        let manager = SaltManager::new(seed).unwrap();
-
-        // Same sub, different issuers - must produce different salts
-        let claims_google = JwtClaims {
-            iss: "https://accounts.google.com".to_string(),
-            aud: "test-app".to_string(),
-            sub: "12345".to_string(),
-            exp: 1234567890,
-            iat: 1234567890,
-            nonce: None,
-            email: None,
-            email_verified: None,
-            name: None,
-            picture: None,
-            given_name: None,
-            family_name: None,
-        };
-
-        let claims_facebook = JwtClaims {
-            iss: "https://www.facebook.com".to_string(),
-            aud: "test-app".to_string(),
-            sub: "12345".to_string(),
-            exp: 1234567890,
-            iat: 1234567890,
-            nonce: None,
-            email: None,
-            email_verified: None,
-            name: None,
-            picture: None,
-            given_name: None,
-            family_name: None,
-        };
-
-        let salt_google = manager.generate_salt(&claims_google).unwrap();
-        let salt_facebook = manager.generate_salt(&claims_facebook).unwrap();
-
-        assert_ne!(salt_google, salt_facebook, "Salts must differ when iss differs (same sub)");
     }
 }

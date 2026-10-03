@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,7 +19,8 @@ pub struct SessionClaims {
     pub iss: String,
     pub aud: String,
     pub sub: String,
-    pub wallet_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_address: Option<String>,
     pub provider: String,
     pub iat: i64,
     pub exp: i64,
@@ -47,7 +48,7 @@ fn signing_key(signing_key_base64: &str) -> Result<SigningKey> {
 
 pub fn issue_access_token(
     user_identifier: &str,
-    wallet_address: &str,
+    wallet_address: Option<&str>,
     provider: &str,
     client_id: &str,
     issuer: &str,
@@ -59,7 +60,10 @@ pub fn issue_access_token(
         iss: issuer.to_string(),
         aud: client_id.to_string(),
         sub: user_identifier.to_string(),
-        wallet_address: wallet_address.to_lowercase(),
+        wallet_address: wallet_address
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_lowercase()),
         provider: provider.to_string(),
         iat: now,
         exp: now + ACCESS_TOKEN_EXPIRY_SECS,
@@ -108,6 +112,44 @@ pub fn hash_refresh_token(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+pub fn verify_access_token(token: &str, signing_key_base64: &str) -> Result<SessionClaims> {
+    let mut parts = token.split('.');
+    let header = parts.next().context("Missing JWT header")?;
+    let payload = parts.next().context("Missing JWT payload")?;
+    let signature = parts.next().context("Missing JWT signature")?;
+    if parts.next().is_some() {
+        anyhow::bail!("Invalid JWT");
+    }
+    let signature_bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(signature)
+        .context("Invalid JWT signature encoding")?;
+    let signature = Signature::from_slice(&signature_bytes).context("Invalid JWT signature")?;
+    let signing_input = format!("{header}.{payload}");
+    signing_key(signing_key_base64)?
+        .verifying_key()
+        .verify(signing_input.as_bytes(), &signature)
+        .context("JWT signature verification failed")?;
+    let payload_bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .context("Invalid JWT payload encoding")?;
+    let claims: SessionClaims = serde_json::from_slice(&payload_bytes).context("Invalid JWT claims")?;
+    if claims.exp <= Utc::now().timestamp() {
+        anyhow::bail!("JWT expired");
+    }
+    Ok(claims)
+}
+
+/// Canonical proof-of-possession message for a vault write.
+pub fn vault_possession_message(sub: &str, address: &str, vault_hash: &str, nonce: &str) -> String {
+    format!(
+        "mysocial/wallet-vault/v1\n{}\n{}\n{}\n{}",
+        sub.trim(),
+        address.trim().to_lowercase(),
+        vault_hash.trim(),
+        nonce.trim()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,7 +160,7 @@ mod tests {
         let seed = general_purpose::STANDARD.encode([7u8; 32]);
         let token = issue_access_token(
             "https://accounts.google.com:user",
-            "0x1234",
+            Some("0x1234"),
             "google",
             "dripdrop",
             "https://salt.testnet.mysocial.network",

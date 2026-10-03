@@ -2,9 +2,8 @@ use axum::{
     extract::{State, Json, ConnectInfo},
     http::{StatusCode, HeaderMap}
 };
-use base64::engine::general_purpose;
 use std::net::SocketAddr;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 use hex;
 
 use chrono::Utc;
@@ -13,12 +12,12 @@ use crate::{
     config::resolve_oauth_redirect_uri_for_token_exchange,
     auth::exchange,
     models::{
-        GetSaltRequest, GetSaltResponse, HealthCheckResponse, ActionType,
+        HealthCheckResponse, ActionType,
         AuthCallbackRequest, AuthCallbackResponse, LogoutRequest, RefreshRequest,
-        RefreshResponse, WalletAuthRequest,
+        RefreshResponse, WalletAuthRequest, PutWalletVaultRequest, WalletVaultRecord,
+        WalletVaultResponse, VaultChallengeResponse,
     },
     security::{
-        address_derivation,
         jwt::JwtValidator,
         hash_token_for_audit,
         session_token,
@@ -82,308 +81,6 @@ fn get_oauth_client_id_for_provider(
     }
 }
 
-/// Convert salt bytes to BigInt string for zkLogin compatibility
-/// Converts exactly 16 bytes to a BigInt decimal string following zkLogin standards
-fn salt_to_bigint_string(salt_bytes: &[u8]) -> String {
-    // zkLogin requires exactly 16 bytes (128 bits), but handle legacy 32-byte salts
-    let salt_16_bytes = if salt_bytes.len() == 32 {
-        // Legacy 32-byte salt - take first 16 bytes for zkLogin compatibility
-        &salt_bytes[0..16]
-    } else if salt_bytes.len() == 16 {
-        // Modern 16-byte salt - use as-is
-        salt_bytes
-    } else {
-        panic!("Salt must be either 16 bytes (new format) or 32 bytes (legacy format), got {} bytes", salt_bytes.len());
-    };
-    
-    // Convert bytes to hex string (32 characters for 16 bytes)
-    let hex_salt = hex::encode(salt_16_bytes);
-    
-    // Parse as hex BigInt and convert to decimal string
-    let bigint_value = u128::from_str_radix(&hex_salt, 16)
-        .expect("Failed to parse hex salt as BigInt");
-    
-    // Return as decimal string (BigInt format)
-    bigint_value.to_string()
-}
-
-/// Handle salt generation/retrieval requests
-pub async fn get_salt(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(request): Json<GetSaltRequest>,
-) -> Result<Json<GetSaltResponse>, (StatusCode, String)> {
-    state.metrics.increment_requests();
-    
-    let ip_address = addr.ip().to_string();
-    let user_agent = headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    
-    // Rate limiting
-    let rate_limit_ok = state
-        .store
-        .check_rate_limit(&ip_address, 1, state.config.rate_limit_per_minute)
-        .await
-        .map_err(|e| {
-            error!("Rate limit check failed: {}", e);
-            state.metrics.increment_failed();
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string())
-        })?;
-
-    if !rate_limit_ok {
-        warn!("Rate limit exceeded for IP: {}", ip_address);
-        state.metrics.increment_rate_limit();
-        state.metrics.increment_failed();
-        return Err((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string()));
-    }
-
-    // Extract claims based on request type
-    let (claims, token_hash) = if request.is_jwt() {
-        // JWT-based request (legacy or JWT providers)
-        let token = request.token();
-        match state.jwt_validator.validate(token).await {
-            Ok(c) => {
-                let hash = hash_token_for_audit(token);
-                (c, hash)
-            }
-            Err(e) => {
-                error!("JWT validation failed: {}", e);
-                state.metrics.increment_jwt_failed();
-                state.metrics.increment_failed();
-                
-                // Log failed attempt
-                let _ = state.store.log_audit(
-                    "unknown",
-                    ActionType::Error,
-                    Some(ip_address),
-                    user_agent,
-                    Some(hash_token_for_audit(token)),
-                    false,
-                    Some(e.to_string()),
-                ).await;
-                
-                return Err((StatusCode::UNAUTHORIZED, "Invalid JWT".to_string()));
-            }
-        }
-    } else {
-        // Provider + token request (Facebook/Twitch/MySocial)
-        let provider = request.provider().unwrap_or("unknown");
-        let provider_lower = provider.to_lowercase();
-        
-        // Apple only supports JWT format, not provider+token format
-        if provider_lower == "apple" {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Apple authentication requires JWT format. Use { \"jwt\": \"...\" } instead of { \"provider\": \"apple\", \"token\": \"...\" }".to_string(),
-            ));
-        }
-        
-        let token = request.token();
-        
-        let (claims, token_hash) = if provider_lower == "mysocial" {
-            match state.jwt_validator.validate(token).await {
-                Ok(c) => {
-                    let hash = hash_token_for_audit(token);
-                    (c, hash)
-                }
-                Err(e) => {
-                    error!("MySocial JWT validation failed: {}", e);
-                    state.metrics.increment_jwt_failed();
-                    state.metrics.increment_failed();
-                    let _ = state.store.log_audit(
-                        "unknown",
-                        ActionType::Error,
-                        Some(ip_address),
-                        user_agent,
-                        Some(hash_token_for_audit(token)),
-                        false,
-                        Some(format!("MySocial: {}", e)),
-                    ).await;
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        "Invalid MySocial JWT. Ensure you are sending id_token (JWT), not access_token.".to_string(),
-                    ));
-                }
-            }
-        } else {
-            match state.access_token_validator.extract_claims_from_token(provider, token).await {
-                Ok(c) => {
-                    let hash = hash_token_for_audit(token);
-                    (c, hash)
-                }
-                Err(e) => {
-                    error!("Access token validation failed for provider {}: {}", provider, e);
-                    state.metrics.increment_jwt_failed();
-                    state.metrics.increment_failed();
-                    let _ = state.store.log_audit(
-                        "unknown",
-                        ActionType::Error,
-                        Some(ip_address),
-                        user_agent,
-                        Some(hash_token_for_audit(token)),
-                        false,
-                        Some(format!("Provider {}: {}", provider, e)),
-                    ).await;
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        format!("Invalid token for provider {}", provider),
-                    ));
-                }
-            }
-        };
-        (claims, token_hash)
-    };
-
-    let user_identifier = if state.config.mysocial_auth_issuer.as_ref().is_some_and(|iss| claims.iss == *iss) {
-        claims.sub.clone()
-    } else {
-        JwtValidator::generate_user_identifier(&claims)
-    };
-
-    tracing::debug!(
-        "Salt lookup for user: {} (iss: {}, sub: {})",
-        user_identifier, claims.iss, claims.sub
-    );
-
-    let is_mysocial = state.config.mysocial_auth_issuer.as_ref().is_some_and(|iss| claims.iss == *iss);
-
-    let salt = match if is_mysocial {
-        state.store.get_salt_by_user_identifier(&user_identifier).await
-    } else {
-        state.store.get_salt(&claims).await
-    } {
-        Ok(Some(existing)) => {
-            // Decrypt existing salt
-            let decrypted = state
-                .salt_manager
-                .decrypt_salt(&existing.encrypted_salt)
-                .map_err(|e| {
-                    error!("Failed to decrypt salt: {}", e);
-                    state.metrics.increment_failed();
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Decryption error".to_string())
-                })?;
-
-            // Log read action
-            let _ = state.store.log_audit(
-                &user_identifier,
-                ActionType::Read,
-                Some(ip_address),
-                user_agent,
-                Some(token_hash),
-                true,
-                None,
-            ).await;
-
-            tracing::debug!("Successfully retrieved existing salt for user: {}", user_identifier);
-            state.metrics.increment_salt_retrieved();
-            decrypted
-        }
-        Ok(None) => {
-            if is_mysocial {
-                error!("No salt found for MySocial user {} - user must authenticate via OAuth first", user_identifier);
-                state.metrics.increment_failed();
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    "No salt found for this user. Please authenticate via OAuth (Google, Apple, etc.) first.".to_string(),
-                ));
-            }
-            // Generate new salt
-            let salt = state
-                .salt_manager
-                .generate_salt(&claims)
-                .map_err(|e| {
-                    error!("Failed to generate salt: {}", e);
-                    state.metrics.increment_failed();
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Generation error".to_string())
-                })?;
-
-            // Encrypt and store
-            let encrypted = state
-                .salt_manager
-                .encrypt_salt(&salt)
-                .map_err(|e| {
-                    error!("Failed to encrypt salt: {}", e);
-                    state.metrics.increment_failed();
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Encryption error".to_string())
-                })?;
-
-            // Store salt - ON CONFLICT will return existing row if race condition occurred
-            let stored_salt = state.store.store_salt(&claims, &encrypted).await
-                .map_err(|e| {
-                    error!("Failed to store salt: {}", e);
-                    state.metrics.increment_failed();
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Storage error".to_string())
-                })?;
-
-            // Decrypt the stored salt (could be newly inserted or existing from race condition)
-            let decrypted = state
-                .salt_manager
-                .decrypt_salt(&stored_salt.encrypted_salt)
-                .map_err(|e| {
-                    error!("Failed to decrypt stored salt: {}", e);
-                    state.metrics.increment_failed();
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Decryption error".to_string())
-                })?;
-
-            // Verify the decrypted salt matches what we generated (consistency check)
-            if decrypted != salt {
-                error!("CRITICAL: Stored salt mismatch for user {} - consistency check failed", user_identifier);
-                state.metrics.increment_failed();
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Salt consistency check failed".to_string(),
-                ));
-            }
-
-            // Check if this was a new insert or existing salt by checking created_at vs updated_at
-            let is_new = stored_salt.created_at == stored_salt.updated_at;
-            
-            if is_new {
-                // Log creation
-                let _ = state.store.log_audit(
-                    &user_identifier,
-                    ActionType::Create,
-                    Some(ip_address),
-                    user_agent,
-                    Some(token_hash),
-                    true,
-                    None,
-                ).await;
-                tracing::debug!("Successfully created new salt for user: {}", user_identifier);
-                state.metrics.increment_salt_created();
-            } else {
-                // Race condition: another request created it first
-                tracing::debug!("Race condition detected for user {} - salt was created by another request", user_identifier);
-                let _ = state.store.log_audit(
-                    &user_identifier,
-                    ActionType::Read,
-                    Some(ip_address),
-                    user_agent,
-                    Some(token_hash),
-                    true,
-                    None,
-                ).await;
-                state.metrics.increment_salt_retrieved();
-            }
-            
-            salt
-        }
-        Err(e) => {
-            error!("Database error: {}", e);
-            state.metrics.increment_failed();
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string()));
-        }
-    };
-
-    state.metrics.increment_success();
-    Ok(Json(GetSaltResponse {
-        salt: salt_to_bigint_string(&salt),
-    }))
-}
-
 /// Health check endpoint
 pub async fn health_check(
     State(state): State<AppState>,
@@ -419,24 +116,6 @@ pub async fn health_check(
 //     }
 // }
 
-pub async fn salt_check(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    match sqlx::query("SELECT 1 as check")
-        .fetch_one(state.store.pool())
-        .await
-    {
-        Ok(_) => Ok(Json(serde_json::json!({
-            "status": "ready",
-            "salt_endpoint": "/salt",
-            "version": env!("CARGO_PKG_VERSION")
-        }))),
-        Err(e) => {
-            error!("Salt check failed: {}", e);
-            Err(StatusCode::SERVICE_UNAVAILABLE)
-        }
-    }
-}
 
 pub async fn auth_provider_callback(
     State(state): State<AppState>,
@@ -580,49 +259,19 @@ pub async fn auth_provider_callback(
 
     let user_identifier = JwtValidator::generate_user_identifier(&claims);
     tracing::debug!(
-        "Auth callback: salt lookup for user {} (iss: {}, sub: {})",
+        "Auth callback for user {} (iss: {}, sub: {})",
         user_identifier, claims.iss, claims.sub
     );
 
-    let salt = match state.store.get_salt(&claims).await {
-        Ok(Some(existing)) => {
-            state
-                .salt_manager
-                .decrypt_salt(&existing.encrypted_salt)
-                .map_err(|e| {
-                    error!("Failed to decrypt salt: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Decryption error".to_string())
-                })?
-        }
-        Ok(None) => {
-            let salt_bytes = state.salt_manager.generate_salt(&claims).map_err(|e| {
-                error!("Failed to generate salt: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Salt generation error".to_string())
-            })?;
-            let encrypted = state.salt_manager.encrypt_salt(&salt_bytes).map_err(|e| {
-                error!("Failed to encrypt salt: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Encryption error".to_string())
-            })?;
-            let stored = state.store.store_salt(&claims, &encrypted).await.map_err(|e| {
-                error!("Failed to store salt: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Storage error".to_string())
-            })?;
-            state
-                .salt_manager
-                .decrypt_salt(&stored.encrypted_salt)
-                .map_err(|e| {
-                    error!("Failed to decrypt stored salt: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Decryption error".to_string())
-                })?
-        }
-        Err(e) => {
-            error!("Database error: {}", e);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            ));
-        }
-    };
+    let registered_address = state
+        .store
+        .get_wallet_vault(&user_identifier)
+        .await
+        .map_err(|e| {
+            error!("Failed to load wallet vault: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())
+        })?
+        .map(|record| record.address);
 
     let _ = state.store.log_audit(
         &user_identifier,
@@ -640,17 +289,13 @@ pub async fn auth_provider_callback(
         .or(tokens.access_token.clone())
         .unwrap_or_default();
 
-    let salt_str = salt_to_bigint_string(&salt);
-    let wallet_address = address_derivation::derive_ed25519_address(&claims.sub, &salt_str)
-        .map_err(|e| {
-            error!("Failed to derive Ed25519 address: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Wallet derivation failed".to_string())
-        })?;
     let mut user_obj = serde_json::Map::new();
-    user_obj.insert(
-        "address".to_string(),
-        serde_json::Value::String(wallet_address.clone()),
-    );
+    if let Some(ref wallet_address) = registered_address {
+        user_obj.insert(
+            "address".to_string(),
+            serde_json::Value::String(wallet_address.clone()),
+        );
+    }
     user_obj.insert("sub".to_string(), serde_json::Value::String(claims.sub.clone()));
     if let Some(ref email) = claims.email {
         user_obj.insert("email".to_string(), serde_json::Value::String(email.clone()));
@@ -670,7 +315,7 @@ pub async fn auth_provider_callback(
         {
             let access_token = session_token::issue_access_token(
                 &user_identifier,
-                &wallet_address,
+                registered_address.as_deref(),
                 &provider,
                 &request.client_id,
                 issuer,
@@ -693,7 +338,7 @@ pub async fn auth_provider_callback(
                 .store
                 .store_refresh_session(
                     &user_identifier,
-                    &wallet_address,
+                    registered_address.as_deref().unwrap_or(""),
                     &provider,
                     &request.client_id,
                     &refresh_hash,
@@ -716,7 +361,6 @@ pub async fn auth_provider_callback(
 
     Ok(Json(AuthCallbackResponse {
         code,
-        salt: salt_str,
         id_token: tokens.id_token.clone(),
         user,
         access_token: tokens.access_token,
@@ -793,7 +437,7 @@ pub async fn auth_wallet_callback(
         {
             let access_token = session_token::issue_access_token(
                 &user_identifier,
-                &request.address,
+                Some(&request.address),
                 "wallet",
                 &request.client_id,
                 issuer,
@@ -839,7 +483,6 @@ pub async fn auth_wallet_callback(
 
     Ok(Json(AuthCallbackResponse {
         code: request.address.clone(),
-        salt: String::new(),
         id_token: None,
         user: Some(serde_json::Value::Object(user_obj)),
         access_token: None,
@@ -916,9 +559,10 @@ pub async fn auth_refresh(
         .jwt_issuer
         .as_deref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Session issuer unavailable".to_string()))?;
+    let wallet_address = session.wallet_address.trim();
     let access_token = session_token::issue_access_token(
         &session.user_identifier,
-        &session.wallet_address,
+        if wallet_address.is_empty() { None } else { Some(wallet_address) },
         &session.provider,
         &session.client_id,
         issuer,
@@ -935,9 +579,11 @@ pub async fn auth_refresh(
         session_access_token: access_token,
         refresh_token: new_refresh_token,
         expires_in: session_token::ACCESS_TOKEN_EXPIRY_SECS as u64,
-        user: serde_json::json!({
-            "address": session.wallet_address,
-        }),
+        user: if wallet_address.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({ "address": wallet_address })
+        },
     }))
 }
 
@@ -983,85 +629,196 @@ pub async fn get_metrics(
     Json(state.metrics.get_stats())
 }
 
-/// Test endpoint for development - accepts simple JWTs
-pub async fn get_salt_test(
+const MAX_VAULT_FIELD: usize = 16_384;
+
+fn bearer_session_token(headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
+    let value = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    token
+        .map(str::to_string)
+        .ok_or((StatusCode::UNAUTHORIZED, "Bearer token required".to_string()))
+}
+
+async fn authenticated_subject(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, String)> {
+    let token = bearer_session_token(headers)?;
+    let key = state.config.jwt_signing_key.as_deref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session signing unavailable".to_string(),
+    ))?;
+    let claims = session_token::verify_access_token(&token, key).map_err(|e| {
+        error!("Vault session verification failed: {}", e);
+        (StatusCode::UNAUTHORIZED, "Invalid session".to_string())
+    })?;
+    Ok(claims.sub)
+}
+
+fn bounded(value: &str, label: &str) -> Result<(), (StatusCode, String)> {
+    if value.len() > MAX_VAULT_FIELD {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{label} is too large"),
+        ));
+    }
+    Ok(())
+}
+
+fn is_wallet_address(value: &str) -> bool {
+    let rest = value.strip_prefix("0x").unwrap_or("");
+    rest.len() == 64 && rest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub async fn wallet_vault_challenge(
     State(state): State<AppState>,
-    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
-    Json(request): Json<GetSaltRequest>,
-) -> Result<Json<GetSaltResponse>, (StatusCode, String)> {
-    // Only allow in non-production environments
-    if std::env::var("ENVIRONMENT").unwrap_or_default() == "production" {
-        return Err((StatusCode::NOT_FOUND, "Not found".to_string()));
-    }
-
-    state.metrics.increment_requests();
-    
-    // let ip_address = addr.ip().to_string();
-    // let user_agent = headers
-    //     .get("user-agent")
-    //     .and_then(|v| v.to_str().ok())
-    //     .map(|s| s.to_string());
-
-    // Decode the JWT without validation for testing
-    let token = match &request {
-        GetSaltRequest::Jwt { jwt } => jwt,
-        GetSaltRequest::Provider { .. } => {
-            return Err((StatusCode::BAD_REQUEST, "Test endpoint only accepts JWT format".to_string()));
-        }
-    };
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return Err((StatusCode::BAD_REQUEST, "Invalid JWT format".to_string()));
-    }
-
-    // Decode payload
-    let payload_bytes = base64::Engine::decode(
-        &general_purpose::URL_SAFE_NO_PAD,
-        parts[1]
-    ).map_err(|_| (StatusCode::BAD_REQUEST, "Invalid base64 in JWT".to_string()))?;
-    
-    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid JSON in JWT payload".to_string()))?;
-
-    // Create fake claims for testing
-    let claims = crate::models::JwtClaims {
-        iss: payload.get("iss")
-            .and_then(|v| v.as_str())
-            .unwrap_or("https://test.example.com")
-            .to_string(),
-        aud: payload.get("aud")
-            .and_then(|v| v.as_str())
-            .unwrap_or("test-client-id")
-            .to_string(),
-        sub: payload.get("sub")
-            .and_then(|v| v.as_str())
-            .unwrap_or("test-user-id")
-            .to_string(),
-        exp: payload.get("exp").and_then(|v| v.as_i64()).unwrap_or(1999999999),
-        iat: payload.get("iat").and_then(|v| v.as_i64()).unwrap_or(1516239022),
-        nonce: None,
-        email: payload.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        email_verified: payload.get("email_verified").and_then(|v| v.as_bool()),
-        name: payload.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        picture: payload.get("picture").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        given_name: payload.get("given_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        family_name: payload.get("family_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
-    };
-
-    // Generate salt (same logic as production)
-    let salt = state
-        .salt_manager
-        .generate_salt(&claims)
+    headers: HeaderMap,
+) -> Result<Json<VaultChallengeResponse>, (StatusCode, String)> {
+    let subject = authenticated_subject(&state, &headers).await?;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(5);
+    state
+        .store
+        .insert_vault_challenge(&nonce, &subject, expires_at)
+        .await
         .map_err(|e| {
-            error!("Failed to generate salt: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Generation error".to_string())
+            error!("Failed to store vault challenge: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Challenge storage failed".to_string())
+        })?;
+    Ok(Json(VaultChallengeResponse {
+        nonce,
+        expires_in: 300,
+    }))
+}
+
+pub async fn get_wallet_vault(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WalletVaultResponse>, (StatusCode, String)> {
+    let subject = authenticated_subject(&state, &headers).await?;
+    let record = state
+        .store
+        .get_wallet_vault(&subject)
+        .await
+        .map_err(|e| {
+            error!("Failed to load wallet vault: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())
+        })?
+        .ok_or((StatusCode::NOT_FOUND, "No wallet vault".to_string()))?;
+    Ok(Json(vault_response(record)))
+}
+
+pub async fn put_wallet_vault(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PutWalletVaultRequest>,
+) -> Result<Json<WalletVaultResponse>, (StatusCode, String)> {
+    let subject = authenticated_subject(&state, &headers).await?;
+    if request.version != 1 {
+        return Err((StatusCode::BAD_REQUEST, "Unsupported vault version".to_string()));
+    }
+    if !is_wallet_address(&request.address) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid wallet address".to_string()));
+    }
+    for (label, value) in [
+        ("vault", request.vault.as_str()),
+        ("recoveryWrappedWek", request.recovery_wrapped_wek.as_str()),
+        ("recoveryKdfSalt", request.recovery_kdf_salt.as_str()),
+        ("signature", request.signature.as_str()),
+        ("nonce", request.nonce.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err((StatusCode::BAD_REQUEST, format!("{label} is required")));
+        }
+        bounded(value, label)?;
+    }
+    if let Some(value) = request.credential_id.as_deref() {
+        bounded(value, "credentialId")?;
+    }
+    if let Some(value) = request.prf_salt.as_deref() {
+        bounded(value, "prfSalt")?;
+    }
+    if let Some(value) = request.prf_wrapped_wek.as_deref() {
+        bounded(value, "prfWrappedWek")?;
+    }
+
+    let vault_hash = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(request.vault.as_bytes()))
+    };
+    let message = session_token::vault_possession_message(
+        &subject,
+        &request.address,
+        &vault_hash,
+        &request.nonce,
+    );
+    wallet_signature::verify_wallet_signature(&request.address, &message, &request.signature)
+        .map_err(|e| {
+            error!("Vault proof of possession failed: {}", e);
+            (StatusCode::UNAUTHORIZED, "Invalid vault signature".to_string())
         })?;
 
-    // Log for testing (iss/aud only - never log sub, email, or other PII)
-    info!("Test endpoint: Generated salt for iss={} aud={}", claims.iss, claims.aud);
+    let consumed = state
+        .store
+        .consume_vault_challenge(&request.nonce, &subject)
+        .await
+        .map_err(|e| {
+            error!("Failed to consume vault challenge: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Challenge check failed".to_string())
+        })?;
+    if !consumed {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Vault challenge is invalid or already used".to_string(),
+        ));
+    }
 
-    state.metrics.increment_success();
-    Ok(Json(GetSaltResponse {
-        salt: salt_to_bigint_string(&salt),
-    }))
+    let address = request.address.trim().to_lowercase();
+    let record = WalletVaultRecord {
+        user_identifier: subject.clone(),
+        address: address.clone(),
+        version: request.version,
+        credential_id: request.credential_id,
+        prf_salt: request.prf_salt,
+        prf_wrapped_wek: request.prf_wrapped_wek,
+        recovery_wrapped_wek: request.recovery_wrapped_wek,
+        recovery_kdf_salt: request.recovery_kdf_salt,
+        vault: request.vault,
+        vault_hash,
+        updated_at: chrono::Utc::now(),
+    };
+    state.store.upsert_wallet_vault(&record).await.map_err(|e| {
+        error!("Failed to store wallet vault: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Vault storage failed".to_string())
+    })?;
+    state
+        .store
+        .set_refresh_wallet_address(&subject, &address)
+        .await
+        .map_err(|e| {
+            error!("Failed to update session wallet address: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Session update failed".to_string())
+        })?;
+    Ok(Json(vault_response(record)))
+}
+
+fn vault_response(record: WalletVaultRecord) -> WalletVaultResponse {
+    WalletVaultResponse {
+        address: record.address,
+        version: record.version,
+        credential_id: record.credential_id,
+        prf_salt: record.prf_salt,
+        prf_wrapped_wek: record.prf_wrapped_wek,
+        recovery_wrapped_wek: record.recovery_wrapped_wek,
+        recovery_kdf_salt: record.recovery_kdf_salt,
+        vault: record.vault,
+        vault_hash: record.vault_hash,
+    }
 }

@@ -157,21 +157,27 @@ fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
 
     let cors = if origins.is_empty() {
         CorsLayer::new()
-            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
     } else {
         CorsLayer::new()
             .allow_origin(origins)
-            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
     };
 
     let mut router = Router::new()
         .route("/health", get(myso_salt_service::handlers::health_check))
-        .route("/salt", post(myso_salt_service::handlers::get_salt))
-        .route("/salt/check", get(myso_salt_service::handlers::salt_check))
-        .route("/salt/test", post(myso_salt_service::handlers::get_salt_test))
         .route("/metrics", get(myso_salt_service::handlers::get_metrics))
+        .route(
+            "/wallet-vault/challenge",
+            post(myso_salt_service::handlers::wallet_vault_challenge),
+        )
+        .route(
+            "/wallet-vault",
+            get(myso_salt_service::handlers::get_wallet_vault)
+                .put(myso_salt_service::handlers::put_wallet_vault),
+        )
         .route(
             "/.well-known/jwks.json",
             get(myso_salt_service::handlers::session_jwks),
