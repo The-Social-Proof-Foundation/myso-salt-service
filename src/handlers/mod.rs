@@ -1,5 +1,5 @@
 use axum::{
-    extract::{State, Json, ConnectInfo},
+    extract::{State, Json, ConnectInfo, Query},
     http::{StatusCode, HeaderMap}
 };
 use std::net::SocketAddr;
@@ -16,7 +16,7 @@ use crate::{
         HealthCheckResponse,
         AuthCallbackRequest, AuthCallbackResponse, LogoutRequest, RefreshRequest,
         RefreshResponse, WalletAuthRequest, PutWalletVaultRequest, WalletVaultRecord,
-        WalletVaultResponse, VaultChallengeResponse,
+        WalletVaultResponse, PasskeyVaultResponse, VaultChallengeResponse,
     },
     security::{
         jwt::JwtValidator,
@@ -753,6 +753,78 @@ pub async fn wallet_vault_challenge(
     Ok(Json(VaultChallengeResponse {
         nonce,
         expires_in: 300,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyVaultQuery {
+    credential_id: String,
+}
+
+pub async fn get_wallet_vault_by_passkey(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<PasskeyVaultQuery>,
+) -> Result<Json<PasskeyVaultResponse>, (StatusCode, String)> {
+    let credential_id = query.credential_id.trim();
+    if credential_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "credentialId is required".to_string()));
+    }
+    bounded(credential_id, "credentialId")?;
+    if credential_id.len() < 16 {
+        return Err((StatusCode::BAD_REQUEST, "credentialId is required".to_string()));
+    }
+    let ip_allowed = state
+        .store
+        .check_rate_limit(&format!("passkey-vault-ip:{}", addr.ip()), 1, 5)
+        .await
+        .map_err(|e| {
+            error!("Passkey vault rate limit check failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string())
+        })?;
+    if !ip_allowed {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string()));
+    }
+    let credential_key = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(credential_id.as_bytes()))
+    };
+    let credential_allowed = state
+        .store
+        .check_rate_limit(&format!("passkey-vault-id:{credential_key}"), 10, 3)
+        .await
+        .map_err(|e| {
+            error!("Passkey vault credential rate limit check failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string())
+        })?;
+    if !credential_allowed {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string()));
+    }
+    let record = state
+        .store
+        .get_wallet_vault_by_credential(credential_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to load wallet vault by credential: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())
+        })?;
+    let Some(record) = record else {
+        return Err((StatusCode::NOT_FOUND, "No wallet vault".to_string()));
+    };
+    let (Some(prf_salt), Some(prf_wrapped_wek)) = (record.prf_salt, record.prf_wrapped_wek) else {
+        return Err((StatusCode::NOT_FOUND, "No wallet vault".to_string()));
+    };
+    if prf_salt.trim().is_empty() || prf_wrapped_wek.trim().is_empty() || record.vault.trim().is_empty() {
+        return Err((StatusCode::NOT_FOUND, "No wallet vault".to_string()));
+    }
+    Ok(Json(PasskeyVaultResponse {
+        address: record.address,
+        version: record.version,
+        credential_id: credential_id.to_string(),
+        prf_salt,
+        prf_wrapped_wek,
+        vault: record.vault,
     }))
 }
 

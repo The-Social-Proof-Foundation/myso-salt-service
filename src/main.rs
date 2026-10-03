@@ -165,6 +165,10 @@ fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
             post(myso_salt_service::handlers::wallet_vault_challenge),
         )
         .route(
+            "/wallet-vault/passkey",
+            get(myso_salt_service::handlers::get_wallet_vault_by_passkey),
+        )
+        .route(
             "/wallet-vault",
             get(myso_salt_service::handlers::get_wallet_vault)
                 .put(myso_salt_service::handlers::put_wallet_vault),

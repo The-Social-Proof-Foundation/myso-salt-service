@@ -335,6 +335,24 @@ impl SaltStore {
         .context("Failed to load wallet vault")
     }
 
+    pub async fn get_wallet_vault_by_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<crate::models::WalletVaultRecord>> {
+        sqlx::query_as::<_, crate::models::WalletVaultRecord>(
+            r#"
+            SELECT user_identifier, address, version, credential_id, prf_salt, prf_wrapped_wek,
+                   recovery_wrapped_wek, recovery_kdf_salt, vault, vault_hash, updated_at
+            FROM wallet_vaults
+            WHERE credential_id = $1
+            "#,
+        )
+        .bind(credential_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to load wallet vault by credential")
+    }
+
     pub async fn upsert_wallet_vault(&self, record: &crate::models::WalletVaultRecord) -> Result<()> {
         sqlx::query(
             r#"

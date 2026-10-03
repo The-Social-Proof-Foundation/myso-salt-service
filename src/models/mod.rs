@@ -236,6 +236,17 @@ pub struct WalletVaultResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyVaultResponse {
+    pub address: String,
+    pub version: i32,
+    pub credential_id: String,
+    pub prf_salt: String,
+    pub prf_wrapped_wek: String,
+    pub vault: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct VaultChallengeResponse {
     pub nonce: String,
     pub expires_in: u64,
